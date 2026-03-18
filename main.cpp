@@ -31,7 +31,7 @@ int main() {
                   << vec[0] << ", " << vec[1] << "..." << std::endl;
         
         // Test context vector
-        std::string test_ctx = "author:john";
+        std::string test_ctx = "john";
         auto ctx_vec = ft.getContextVector(test_ctx);
         std::cout << "Context vector for '" << test_ctx << "': " 
                   << ctx_vec[0] << ", " << ctx_vec[1] << "..." << std::endl;

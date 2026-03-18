@@ -2,7 +2,7 @@
 CXX = g++
 CXXFLAGS = -O3 -std=c++17 -march=native
 TARGET = fasttext_context
-SRC = fasttext_context.cpp main_context.cpp
+SRC = fasttext_context.cpp main.cpp
 
 all: $(TARGET)
 
