@@ -3,11 +3,11 @@
 
 namespace fasttext {
 
-FastTextContext::FastTextContext(int dim, int epoch, float lr, int min_n, int max_n, 
-                                 int threshold, int context_dim)
-    : dim_(dim), context_dim_(context_dim), epoch_(epoch), lr_(lr),
-      min_n_(min_n), max_n_(max_n), threshold_(threshold),
-      rng_(std::random_device{}()), uniform_(0.0, 1.0), normal_(0.0, 1.0) {}
+FastTextContext::FastTextContext(int dim, int epoch, float lr, 
+                                                  int min_n, int max_n, int threshold)
+    : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n), 
+      threshold_(threshold), rng_(std::random_device{}()), 
+      uniform_(0.0, 1.0), normal_(0.0, 1.0) {}
 
 uint64_t FastTextContext::hash(const std::string& str) {
     uint64_t h = 14695981039346656037ULL;
@@ -34,18 +34,14 @@ std::vector<TrainingSample> FastTextContext::parseFile(const std::string& filena
         std::stringstream ss(line);
         std::string field;
         
-        // Split by pipe delimiter
         while (std::getline(ss, field, '|')) {
-            // Last field is the sentence
             if (ss.eof()) {
-                // Tokenize sentence into words
                 std::istringstream sentence_stream(field);
                 std::string word;
                 while (sentence_stream >> word) {
                     sample.words.push_back(word);
                 }
             } else {
-                // All other fields are context metadata
                 sample.context_fields.push_back(field);
             }
         }
@@ -60,7 +56,6 @@ std::vector<TrainingSample> FastTextContext::parseFile(const std::string& filena
 }
 
 void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
-    // Count word frequencies
     std::unordered_map<std::string, int> word_freq;
     std::unordered_map<std::string, int> context_freq;
     
@@ -73,7 +68,6 @@ void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
         }
     }
     
-    // Build word vocabulary
     int word_idx = 0;
     for (const auto& [word, count] : word_freq) {
         if (count >= threshold_) {
@@ -82,7 +76,6 @@ void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
         }
     }
     
-    // Build context vocabulary (keep all, no threshold)
     int ctx_idx = 0;
     for (const auto& [ctx, count] : context_freq) {
         context2idx_[ctx] = ctx_idx++;
@@ -97,7 +90,7 @@ void FastTextContext::initializeMatrices() {
     int context_vocab_size = context2idx_.size();
     int ngram_buckets = 2000000;
     
-    // Word input matrix
+    // Word input matrix - small random initialization
     input_matrix_.resize(vocab_size);
     for (auto& vec : input_matrix_) {
         vec.resize(dim_);
@@ -106,7 +99,7 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Output matrix (same dimension as word embeddings)
+    // Output matrix - initialized to zero
     output_matrix_.resize(vocab_size);
     for (auto& vec : output_matrix_) {
         vec.resize(dim_);
@@ -124,17 +117,18 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Context matrix (separate dimension)
+    // Context matrix
     context_matrix_.resize(context_vocab_size);
     for (auto& vec : context_matrix_) {
-        vec.resize(context_dim_);
+        vec.resize(dim_);
         for (float& v : vec) {
-            v = normal_(rng_) / context_dim_;
+            v = normal_(rng_) / dim_;
         }
     }
     
     std::cout << "Word embeddings: " << vocab_size << " x " << dim_ << std::endl;
-    std::cout << "Context embeddings: " << context_vocab_size << " x " << context_dim_ << std::endl;
+    std::cout << "Context embeddings: " << context_vocab_size << " x " << dim_ << std::endl;
+    std::cout << "N-gram buckets: " << ngram_buckets << " x " << dim_ << std::endl;
 }
 
 std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
@@ -156,7 +150,7 @@ std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
 std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
     std::vector<float> vec(dim_, 0.0f);
     
-    // Add word vector
+    // Add word embedding
     if (word2idx_.count(word)) {
         int idx = word2idx_[word];
         for (int i = 0; i < dim_; ++i) {
@@ -164,7 +158,7 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
         }
     }
     
-    // Add n-gram vectors
+    // Add n-gram embeddings
     auto ngram_indices = getNgramIndices(word);
     for (int idx : ngram_indices) {
         for (int i = 0; i < dim_; ++i) {
@@ -172,70 +166,52 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
         }
     }
     
-    // Normalize
-    float norm = 0.0f;
-    for (float v : vec) norm += v * v;
-    norm = std::sqrt(norm);
-    if (norm > 0) {
-        for (float& v : vec) v /= norm;
-    }
-    
     return vec;
 }
 
 std::vector<float> FastTextContext::computeContextVector(const std::vector<std::string>& contexts) {
-    std::vector<float> vec(context_dim_, 0.0f);
+    std::vector<float> vec(dim_, 0.0f);
     int count = 0;
     
     for (const auto& ctx : contexts) {
         if (context2idx_.count(ctx)) {
             int idx = context2idx_[ctx];
-            for (int i = 0; i < context_dim_; ++i) {
+            for (int i = 0; i < dim_; ++i) {
                 vec[i] += context_matrix_[idx][i];
             }
             count++;
         }
     }
     
-    // Average across context fields
     if (count > 0) {
-        for (float& v : vec) v /= count;
-    }
-    
-    // Normalize
-    float norm = 0.0f;
-    for (float v : vec) norm += v * v;
-    norm = std::sqrt(norm);
-    if (norm > 0) {
-        for (float& v : vec) v /= norm;
-    }
+        for (float& v : vec) v /= count;  // Average
+}
     
     return vec;
-}
+  }
 
-std::vector<float> FastTextContext::combineVectors(const std::vector<float>& word_vec,
-                                                    const std::vector<float>& context_vec) {
-    // Concatenate word and context vectors
-    std::vector<float> combined;
-    combined.reserve(word_vec.size() + context_vec.size());
-    combined.insert(combined.end(), word_vec.begin(), word_vec.end());
-    combined.insert(combined.end(), context_vec.begin(), context_vec.end());
+std::vector<float> FastTextContext::combineVectors(
+    const std::vector<float>& word_vec,
+    const std::vector<float>& context_vec) {
+    
+    std::vector<float> combined(dim_);
+    for (int i = 0; i < dim_; ++i) {
+        combined[i] = word_vec[i] + context_vec[i];
+    }
     
     return combined;
 }
 
 void FastTextContext::negativeSampling(const std::vector<float>& combined_input,
-                                       const std::vector<int>& labels,
-                                       float grad_scale) {
+                                               const std::vector<int>& labels,
+                                               float grad_scale) {
     int num_negatives = 5;
     int vocab_size = word2idx_.size();
     
-    // Note: We only update output weights for word predictions
-    // Context is part of input, not predicted
     for (int label : labels) {
         // Positive sample
         for (int i = 0; i < dim_; ++i) {
-            float grad = grad_scale * combined_input[i];  // Use word portion of combined
+            float grad = grad_scale * combined_input[i];
             output_matrix_[label][i] -= lr_ * grad;
         }
         
@@ -254,7 +230,6 @@ void FastTextContext::negativeSampling(const std::vector<float>& combined_input,
 
 void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
     int total_words = 0;
-    
     for (const auto& sample : samples) {
         total_words += sample.words.size();
     }
@@ -268,18 +243,12 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
         for (const auto& sample : samples) {
             if (sample.words.empty()) continue;
             
-            // Compute context vector once per sample
             std::vector<float> context_vec = computeContextVector(sample.context_fields);
             
-            // Skip-gram training
             for (size_t i = 0; i < sample.words.size(); ++i) {
-                // Get word vector
                 std::vector<float> word_vec = computeWordVector(sample.words[i]);
-                
-                // Combine with context
                 std::vector<float> combined = combineVectors(word_vec, context_vec);
                 
-                // Get context window (word predictions)
                 std::vector<int> context;
                 int window = 5;
                 for (int j = std::max(0, static_cast<int>(i) - window); 
@@ -289,9 +258,7 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
                     }
                 }
                 
-                // Update output weights
                 negativeSampling(combined, context, 1.0f);
-                
                 word_count++;
             }
             
@@ -322,11 +289,11 @@ std::vector<float> FastTextContext::getWordVector(const std::string& word) {
 }
 
 std::vector<float> FastTextContext::getContextVector(const std::string& context_field) {
-    std::vector<float> vec(context_dim_, 0.0f);
+    std::vector<float> vec(dim_, 0.0f);
     
     if (context2idx_.count(context_field)) {
         int idx = context2idx_[context_field];
-        for (int i = 0; i < context_dim_; ++i) {
+        for (int i = 0; i < dim_; ++i) {
             vec[i] = context_matrix_[idx][i];
         }
     }
@@ -335,7 +302,7 @@ std::vector<float> FastTextContext::getContextVector(const std::string& context_
 }
 
 std::vector<float> FastTextContext::getCombinedVector(const std::string& word,
-                                                       const std::vector<std::string>& contexts) {
+                                                               const std::vector<std::string>& contexts) {
     std::vector<float> word_vec = computeWordVector(word);
     std::vector<float> context_vec = computeContextVector(contexts);
     return combineVectors(word_vec, context_vec);
@@ -347,18 +314,40 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     std::vector<float> query_vec = computeWordVector(word);
     std::vector<std::pair<std::string, float>> results;
     
+    // Compute query vector magnitude
+    float query_norm = 0.0f;
+    for (float v : query_vec) query_norm += v * v;
+    query_norm = std::sqrt(query_norm);
+    
+    // Handle zero-norm query
+    if (query_norm < 1e-8f) {
+        std::cerr << "Warning: Query vector has near-zero magnitude" << std::endl;
+        return results;
+    }
+    
+    // Normalize query vector
+    for (float& v : query_vec) v /= query_norm;
+    
+    // Compute cosine similarity with all words
     for (const auto& [w, idx] : word2idx_) {
-        float dot = 0.0f;
-        float norm_query = 0.0f;
-        float norm_word = 0.0f;
+        const std::vector<float>& word_vec = input_matrix_[idx];
         
+        // Compute word vector magnitude
+        float word_norm = 0.0f;
+        for (float v : word_vec) word_norm += v * v;
+        word_norm = std::sqrt(word_norm);
+        
+        // Handle zero-norm word
+        if (word_norm < 1e-8f) continue;
+        
+        float dot = 0.0f;
         for (int i = 0; i < dim_; ++i) {
-            dot += query_vec[i] * input_matrix_[idx][i];
-            norm_query += query_vec[i] * query_vec[i];
-            norm_word += input_matrix_[idx][i] * input_matrix_[idx][i];
+            dot += query_vec[i] * word_vec[i];
         }
         
-        float similarity = dot / (std::sqrt(norm_query) * std::sqrt(norm_word));
+        // Cosine similarity = dot / (norm_query * norm_word)
+        float similarity = dot / word_norm;
+        
         results.emplace_back(w, similarity);
     }
     
