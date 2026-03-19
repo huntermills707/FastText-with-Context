@@ -1,13 +1,24 @@
 #include "fasttext_context.h"
 #include <iostream>
+#include <functional>
 
 namespace fasttext {
 
-FastTextContext::FastTextContext(int dim, int epoch, float lr, 
-                                                  int min_n, int max_n, int threshold)
+FastTextContext::FastTextContext(int dim, int epoch, float lr, int min_n, int max_n, int threshold)
     : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n), 
-      threshold_(threshold), rng_(std::random_device{}()), 
-      uniform_(0.0, 1.0), normal_(0.0, 1.0) {}
+      threshold_(threshold), huffman_root_(nullptr),
+      rng_(std::random_device{}()), uniform_(0.0, 1.0), normal_(0.0, 1.0) {}
+
+FastTextContext::~FastTextContext() {
+    cleanupHuffmanTree(huffman_root_);
+}
+
+void FastTextContext::cleanupHuffmanTree(HuffmanNode* node) {
+    if (node == nullptr) return;
+    cleanupHuffmanTree(node->left);
+    cleanupHuffmanTree(node->right);
+    delete node;
+}
 
 uint64_t FastTextContext::hash(const std::string& str) {
     uint64_t h = 14695981039346656037ULL;
@@ -73,6 +84,7 @@ void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
         if (count >= threshold_) {
             word2idx_[word] = word_idx++;
             word_counts_.push_back(count);
+            word_freqs_.push_back(static_cast<double>(count));
         }
     }
     
@@ -85,12 +97,86 @@ void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
     std::cout << "Context vocabulary: " << context2idx_.size() << std::endl;
 }
 
+void FastTextContext::buildHuffmanTree() {
+    int vocab_size = word2idx_.size();
+    if (vocab_size == 0) return;
+    
+    // Create priority queue of nodes
+    auto cmp = [](HuffmanNode* a, HuffmanNode* b) {
+        return a->frequency > b->frequency;  // Min-heap
+    };
+    std::priority_queue<HuffmanNode*, std::vector<HuffmanNode*>, decltype(cmp)> pq(cmp);
+    
+    // Create leaf nodes for each word
+    std::vector<HuffmanNode*> nodes(vocab_size);
+    for (int i = 0; i < vocab_size; ++i) {
+        nodes[i] = new HuffmanNode(i, word_freqs_[i]);
+        pq.push(nodes[i]);
+    }
+    
+    // Build tree by combining lowest frequency nodes
+    while (pq.size() > 1) {
+        HuffmanNode* left = pq.top(); pq.pop();
+        HuffmanNode* right = pq.top(); pq.pop();
+        
+        HuffmanNode* parent = new HuffmanNode(-1, left->frequency + right->frequency);
+        parent->left = left;
+        parent->right = right;
+        pq.push(parent);
+    }
+    
+    huffman_root_ = pq.top();
+    
+    // Generate codes for each word
+    word_codes_.resize(vocab_size);
+    word_paths_.resize(vocab_size);
+    
+    for (int i = 0; i < vocab_size; ++i) {
+        std::vector<int> code;
+        std::vector<int> path;
+        std::vector<int> path_nodes;
+        generateCodes(nodes[i], code, path, path_nodes);
+        word_codes_[i] = code;
+        word_paths_[i] = path;
+    }
+    
+    std::cout << "Huffman tree built. Max depth: " 
+              << (word_codes_.empty() ? 0 : word_codes_[0].size()) << std::endl;
+}
+
+void FastTextContext::generateCodes(HuffmanNode* node, std::vector<int>& code,
+                                    std::vector<int>& path, std::vector<int>& path_nodes) {
+    if (node == nullptr) return;
+    
+    if (node->word_idx >= 0) {
+        // Leaf node - store the code and path
+        word_codes_[node->word_idx] = code;
+        word_paths_[node->word_idx] = path;
+        return;
+    }
+    
+    // Internal node - traverse children
+    int path_idx = path.size();
+    path.push_back(path_idx);
+    
+    // Left child = 0, Right child = 1
+    code.push_back(0);
+    generateCodes(node->left, code, path, path_nodes);
+    code.pop_back();
+    
+    code.push_back(1);
+    generateCodes(node->right, code, path, path_nodes);
+    code.pop_back();
+    
+    path.pop_back();
+}
+
 void FastTextContext::initializeMatrices() {
     int vocab_size = word2idx_.size();
     int context_vocab_size = context2idx_.size();
     int ngram_buckets = 2000000;
     
-    // Word input matrix - small random initialization
+    // Word input matrix
     input_matrix_.resize(vocab_size);
     for (auto& vec : input_matrix_) {
         vec.resize(dim_);
@@ -99,12 +185,14 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Output matrix - initialized to zero
-    output_matrix_.resize(vocab_size);
+    // Output matrix for hierarchical softmax (internal nodes)
+    // Number of internal nodes = vocab_size - 1
+    int num_internal_nodes = std::max(1, vocab_size - 1);
+    output_matrix_.resize(num_internal_nodes);
     for (auto& vec : output_matrix_) {
         vec.resize(dim_);
         for (float& v : vec) {
-            v = 0.0f;
+            v = normal_(rng_) / dim_;
         }
     }
     
@@ -127,8 +215,8 @@ void FastTextContext::initializeMatrices() {
     }
     
     std::cout << "Word embeddings: " << vocab_size << " x " << dim_ << std::endl;
+    std::cout << "Hierarchical softmax nodes: " << num_internal_nodes << " x " << dim_ << std::endl;
     std::cout << "Context embeddings: " << context_vocab_size << " x " << dim_ << std::endl;
-    std::cout << "N-gram buckets: " << ngram_buckets << " x " << dim_ << std::endl;
 }
 
 std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
@@ -150,7 +238,6 @@ std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
 std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
     std::vector<float> vec(dim_, 0.0f);
     
-    // Add word embedding
     if (word2idx_.count(word)) {
         int idx = word2idx_[word];
         for (int i = 0; i < dim_; ++i) {
@@ -158,7 +245,6 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
         }
     }
     
-    // Add n-gram embeddings
     auto ngram_indices = getNgramIndices(word);
     for (int idx : ngram_indices) {
         for (int i = 0; i < dim_; ++i) {
@@ -184,13 +270,13 @@ std::vector<float> FastTextContext::computeContextVector(const std::vector<std::
     }
     
     if (count > 0) {
-        for (float& v : vec) v /= count;  // Average
-}
+        for (float& v : vec) v /= count;
+    }
     
     return vec;
-  }
+}
 
-std::vector<float> FastTextContext::combineVectors(
+std::vector<float> FastTextContext::combineVectorsAdditive(
     const std::vector<float>& word_vec,
     const std::vector<float>& context_vec) {
     
@@ -202,28 +288,37 @@ std::vector<float> FastTextContext::combineVectors(
     return combined;
 }
 
-void FastTextContext::negativeSampling(const std::vector<float>& combined_input,
-                                               const std::vector<int>& labels,
-                                               float grad_scale) {
-    int num_negatives = 5;
-    int vocab_size = word2idx_.size();
+void FastTextContext::hierarchicalSoftmax(const std::vector<float>& combined_input,
+                                          int target_word_idx,
+                                          float grad_scale) {
+    // Get the path to the target word in the Huffman tree
+    const std::vector<int>& path = word_paths_[target_word_idx];
+    const std::vector<int>& code = word_codes_[target_word_idx];
     
-    for (int label : labels) {
-        // Positive sample
-        for (int i = 0; i < dim_; ++i) {
-            float grad = grad_scale * combined_input[i];
-            output_matrix_[label][i] -= lr_ * grad;
+    // Traverse the path and update weights
+    for (size_t i = 0; i < path.size(); ++i) {
+        int node_idx = path[i];
+        int direction = code[i];  // 0 = left, 1 = right
+        
+        // Sigmoid activation
+        float dot = 0.0f;
+        for (int j = 0; j < dim_; ++j) {
+            dot += output_matrix_[node_idx][j] * combined_input[j];
         }
         
-        // Negative samples
-        for (int n = 0; n < num_negatives; ++n) {
-            int neg_idx = static_cast<int>(uniform_(rng_) * vocab_size);
-            if (neg_idx == label) continue;
-            
-            for (int i = 0; i < dim_; ++i) {
-                float grad = grad_scale * combined_input[i];
-                output_matrix_[neg_idx][i] -= lr_ * grad;
-            }
+        // Clamp to prevent overflow
+        dot = std::max(-20.0f, std::min(20.0f, dot));
+        float sigmoid = 1.0f / (1.0f + std::exp(-dot));
+        
+        // Target: if direction == 0, we want sigmoid close to 1
+        //         if direction == 1, we want sigmoid close to 0
+        float target = (direction == 0) ? 1.0f : 0.0f;
+        float error = target - sigmoid;
+        
+        // Update output weights
+        for (int j = 0; j < dim_; ++j) {
+            float grad = grad_scale * error * combined_input[j];
+            output_matrix_[node_idx][j] += lr_ * grad;
         }
     }
 }
@@ -246,19 +341,17 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
             std::vector<float> context_vec = computeContextVector(sample.context_fields);
             
             for (size_t i = 0; i < sample.words.size(); ++i) {
-                std::vector<float> word_vec = computeWordVector(sample.words[i]);
-                std::vector<float> combined = combineVectors(word_vec, context_vec);
+                std::string word = sample.words[i];
+                if (!word2idx_.count(word)) continue;
                 
-                std::vector<int> context;
-                int window = 5;
-                for (int j = std::max(0, static_cast<int>(i) - window); 
-                     j < std::min(static_cast<int>(sample.words.size()), static_cast<int>(i) + window + 1); ++j) {
-                    if (static_cast<size_t>(j) != i && word2idx_.count(sample.words[j])) {
-                        context.push_back(word2idx_[sample.words[j]]);
-                    }
-                }
+                int target_idx = word2idx_[word];
                 
-                negativeSampling(combined, context, 1.0f);
+                std::vector<float> word_vec = computeWordVector(word);
+                std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
+                
+                // Hierarchical softmax update
+                hierarchicalSoftmax(combined, target_idx, 1.0f);
+                
                 word_count++;
             }
             
@@ -278,6 +371,7 @@ void FastTextContext::train(const std::string& filename) {
     std::cout << "Parsed " << samples.size() << " training samples" << std::endl;
     
     buildVocab(samples);
+    buildHuffmanTree();
     initializeMatrices();
     trainModel(samples);
     
@@ -302,10 +396,10 @@ std::vector<float> FastTextContext::getContextVector(const std::string& context_
 }
 
 std::vector<float> FastTextContext::getCombinedVector(const std::string& word,
-                                                               const std::vector<std::string>& contexts) {
+                                                       const std::vector<std::string>& contexts) {
     std::vector<float> word_vec = computeWordVector(word);
     std::vector<float> context_vec = computeContextVector(contexts);
-    return combineVectors(word_vec, context_vec);
+    return combineVectorsAdditive(word_vec, context_vec);
 }
 
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
@@ -319,7 +413,6 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     for (float v : query_vec) query_norm += v * v;
     query_norm = std::sqrt(query_norm);
     
-    // Handle zero-norm query
     if (query_norm < 1e-8f) {
         std::cerr << "Warning: Query vector has near-zero magnitude" << std::endl;
         return results;
@@ -332,12 +425,10 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     for (const auto& [w, idx] : word2idx_) {
         const std::vector<float>& word_vec = input_matrix_[idx];
         
-        // Compute word vector magnitude
         float word_norm = 0.0f;
         for (float v : word_vec) word_norm += v * v;
         word_norm = std::sqrt(word_norm);
         
-        // Handle zero-norm word
         if (word_norm < 1e-8f) continue;
         
         float dot = 0.0f;
@@ -345,9 +436,7 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
             dot += query_vec[i] * word_vec[i];
         }
         
-        // Cosine similarity = dot / (norm_query * norm_word)
         float similarity = dot / word_norm;
-        
         results.emplace_back(w, similarity);
     }
     

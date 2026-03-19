@@ -9,6 +9,7 @@
 #include <sstream>
 #include <cmath>
 #include <algorithm>
+#include <queue>
 
 namespace fasttext {
 
@@ -17,10 +18,22 @@ struct TrainingSample {
     std::vector<std::string> words;
 };
 
+struct HuffmanNode {
+    int word_idx;
+    double frequency;
+    HuffmanNode* left;
+    HuffmanNode* right;
+    
+    HuffmanNode(int idx, double freq) 
+        : word_idx(idx), frequency(freq), left(nullptr), right(nullptr) {}
+};
+
 class FastTextContext {
 public:
     FastTextContext(int dim = 100, int epoch = 5, float lr = 0.05,
-                           int min_n = 3, int max_n = 6, int threshold = 10);
+                   int min_n = 3, int max_n = 6, int threshold = 10);
+    
+    ~FastTextContext();  // Clean up Huffman tree
     
     void train(const std::string& filename);
     std::vector<float> getWordVector(const std::string& word);
@@ -38,13 +51,21 @@ private:
     int max_n_;
     int threshold_;
     
+    // Word embeddings
     std::unordered_map<std::string, int> word2idx_;
     std::vector<std::vector<float>> input_matrix_;
-    std::vector<std::vector<float>> output_matrix_;
+    std::vector<std::vector<float>> output_matrix_;  // Hierarchical softmax weights
     std::vector<std::vector<float>> ngram_matrix_;
     
+    // Context embeddings
     std::unordered_map<std::string, int> context2idx_;
     std::vector<std::vector<float>> context_matrix_;
+    
+    // Huffman tree for hierarchical softmax
+    HuffmanNode* huffman_root_;
+    std::vector<std::vector<int>> word_codes_;      // Binary codes for each word
+    std::vector<std::vector<int>> word_paths_;      // Path indices for each word
+    std::vector<double> word_freqs_;
     
     std::vector<int> word_counts_;
     
@@ -52,19 +73,24 @@ private:
     std::uniform_real_distribution<float> uniform_;
     std::normal_distribution<float> normal_;
     
+    // Methods
     uint64_t hash(const std::string& str);
     std::vector<TrainingSample> parseFile(const std::string& filename);
     void buildVocab(const std::vector<TrainingSample>& samples);
+    void buildHuffmanTree();
+    void generateCodes(HuffmanNode* node, std::vector<int>& code, 
+                       std::vector<int>& path, std::vector<int>& path_nodes);
     void initializeMatrices();
     void trainModel(const std::vector<TrainingSample>& samples);
     std::vector<int> getNgramIndices(const std::string& word);
     std::vector<float> computeWordVector(const std::string& word);
     std::vector<float> computeContextVector(const std::vector<std::string>& contexts);
-    std::vector<float> combineVectors(const std::vector<float>& word_vec,
+    std::vector<float> combineVectorsAdditive(const std::vector<float>& word_vec,
                                               const std::vector<float>& context_vec);
-    void negativeSampling(const std::vector<float>& combined_input,
-                         const std::vector<int>& labels,
-                         float grad_scale);
+    void hierarchicalSoftmax(const std::vector<float>& combined_input,
+                            int target_word_idx,
+                            float grad_scale);
+    void cleanupHuffmanTree(HuffmanNode* node);
 };
 
 } // namespace fasttext
