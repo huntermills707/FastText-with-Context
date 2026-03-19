@@ -258,8 +258,7 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
     // Add n-gram embeddings
     auto ngram_indices = getNgramIndices(word);
     if (!ngram_indices.empty()) {
-        // Use a raw array for OpenMP reduction
-        float* reduction_buffer = new float[dim_](); // Zero-initialized
+        float* reduction_buffer = new float[dim_]();
         
         #pragma omp parallel for reduction(+:reduction_buffer[:dim_])
         for (int n = 0; n < static_cast<int>(ngram_indices.size()); ++n) {
@@ -269,7 +268,6 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
             }
         }
         
-        // Accumulate results
         for (int i = 0; i < dim_; ++i) {
             vec[i] += reduction_buffer[i];
         }
@@ -327,7 +325,6 @@ void FastTextContext::mergeThreadLocalGradients() {
         }
     }
     
-    // Reset thread-local buffers
     for (int t = 0; t < num_threads_; ++t) {
         for (auto& vec : thread_local_grads_[t]) {
             std::fill(vec.begin(), vec.end(), 0.0f);
@@ -357,7 +354,6 @@ void FastTextContext::hierarchicalSoftmax(const std::vector<float>& combined_inp
         float target = (direction == 0) ? 1.0f : 0.0f;
         float error = target - sigmoid;
         
-        // Accumulate to thread-local buffer (no lock needed)
         for (int j = 0; j < dim_; ++j) {
             thread_local_grads_[thread_id][node_idx][j] += lr_ * error * combined_input[j];
         }
@@ -373,7 +369,7 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
     std::cout << "Training on " << total_words << " words across " 
               << samples.size() << " samples..." << std::endl;
     std::cout << "Using " << num_threads_ << " OpenMP threads with thread-local gradients" << std::endl;
-   
+    
     for (int epoch = 0; epoch < epoch_; ++epoch) {
         int word_count = 0;
         
@@ -394,11 +390,10 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
                 std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
                 
                 hierarchicalSoftmax(combined, target_idx, 1.0f);
-                
                 word_count++;
             }
         }
-
+        
         mergeThreadLocalGradients();
         
         float progress = static_cast<float>(word_count) / total_words;
@@ -419,6 +414,145 @@ void FastTextContext::train(const std::string& filename) {
     trainModel(samples);
     
     std::cout << "Training complete!" << std::endl;
+}
+
+void FastTextContext::saveModel(const std::string& filename) const {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("Cannot open file for writing: " + filename);
+    }
+
+    out.write(reinterpret_cast<const char*>(&dim_), sizeof(dim_));
+    out.write(reinterpret_cast<const char*>(&min_n_), sizeof(min_n_));
+    out.write(reinterpret_cast<const char*>(&max_n_), sizeof(max_n_));
+    out.write(reinterpret_cast<const char*>(&threshold_), sizeof(threshold_));
+    
+    int vocab_size = word2idx_.size();
+    int ctx_size = context2idx_.size();
+    int ngram_size = ngram_matrix_.size();
+    int output_size = output_matrix_.size();
+    
+    out.write(reinterpret_cast<const char*>(&vocab_size), sizeof(vocab_size));
+    out.write(reinterpret_cast<const char*>(&ctx_size), sizeof(ctx_size));
+    out.write(reinterpret_cast<const char*>(&ngram_size), sizeof(ngram_size));
+    out.write(reinterpret_cast<const char*>(&output_size), sizeof(output_size));
+
+    for (const auto& pair : word2idx_) {
+        uint32_t len = pair.first.length();
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(pair.first.c_str(), len);
+        out.write(reinterpret_cast<const char*>(&pair.second), sizeof(pair.second));
+    }
+
+    for (const auto& pair : context2idx_) {
+        uint32_t len = pair.first.length();
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(pair.first.c_str(), len);
+        out.write(reinterpret_cast<const char*>(&pair.second), sizeof(pair.second));
+    }
+
+    auto writeMatrix = [&](const std::vector<std::vector<float>>& mat) {
+        for (const auto& row : mat) {
+            out.write(reinterpret_cast<const char*>(row.data()), row.size() * sizeof(float));
+        }
+    };
+
+    writeMatrix(input_matrix_);
+    writeMatrix(output_matrix_);
+    writeMatrix(ngram_matrix_);
+    writeMatrix(context_matrix_);
+
+    auto writeIntVec = [&](const std::vector<std::vector<int>>& vec) {
+        for (const auto& v : vec) {
+            uint32_t len = v.size();
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            if (len > 0) {
+                out.write(reinterpret_cast<const char*>(v.data()), len * sizeof(int));
+            }
+        }
+    };
+
+    writeIntVec(word_codes_);
+    writeIntVec(word_paths_);
+
+    out.close();
+    std::cout << "Model saved to " << filename << std::endl;
+}
+
+void FastTextContext::loadModel(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Cannot open file for reading: " + filename);
+    }
+
+    in.read(reinterpret_cast<char*>(&dim_), sizeof(dim_));
+    in.read(reinterpret_cast<char*>(&min_n_), sizeof(min_n_));
+    in.read(reinterpret_cast<char*>(&max_n_), sizeof(max_n_));
+    in.read(reinterpret_cast<char*>(&threshold_), sizeof(threshold_));
+    
+    int vocab_size, ctx_size, ngram_size, output_size;
+    in.read(reinterpret_cast<char*>(&vocab_size), sizeof(vocab_size));
+    in.read(reinterpret_cast<char*>(&ctx_size), sizeof(ctx_size));
+    in.read(reinterpret_cast<char*>(&ngram_size), sizeof(ngram_size));
+    in.read(reinterpret_cast<char*>(&output_size), sizeof(output_size));
+
+    input_matrix_.resize(vocab_size, std::vector<float>(dim_));
+    output_matrix_.resize(output_size, std::vector<float>(dim_));
+    ngram_matrix_.resize(ngram_size, std::vector<float>(dim_));
+    context_matrix_.resize(ctx_size, std::vector<float>(dim_));
+
+    word2idx_.clear();
+    for (int i = 0; i < vocab_size; ++i) {
+        uint32_t len;
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        std::string word(len, '\0');
+        in.read(&word[0], len);
+        int idx;
+        in.read(reinterpret_cast<char*>(&idx), sizeof(idx));
+        word2idx_[word] = idx;
+    }
+
+    context2idx_.clear();
+    for (int i = 0; i < ctx_size; ++i) {
+        uint32_t len;
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        std::string ctx(len, '\0');
+        in.read(&ctx[0], len);
+        int idx;
+        in.read(reinterpret_cast<char*>(&idx), sizeof(idx));
+        context2idx_[ctx] = idx;
+    }
+
+    auto readMatrix = [&](std::vector<std::vector<float>>& mat) {
+        for (auto& row : mat) {
+            in.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(float));
+        }
+    };
+
+    readMatrix(input_matrix_);
+    readMatrix(output_matrix_);
+    readMatrix(ngram_matrix_);
+    readMatrix(context_matrix_);
+
+    auto readIntVec = [&](std::vector<std::vector<int>>& vec) {
+        vec.resize(vocab_size);
+        for (int i = 0; i < vocab_size; ++i) {
+            uint32_t len;
+            in.read(reinterpret_cast<char*>(&len), sizeof(len));
+            vec[i].resize(len);
+            if (len > 0) {
+                in.read(reinterpret_cast<char*>(vec[i].data()), len * sizeof(int));
+            }
+        }
+    };
+
+    readIntVec(word_codes_);
+    readIntVec(word_paths_);
+
+    huffman_root_ = nullptr; 
+
+    in.close();
+    std::cout << "Model loaded from " << filename << std::endl;
 }
 
 std::vector<float> FastTextContext::getWordVector(const std::string& word) {
@@ -445,13 +579,11 @@ std::vector<float> FastTextContext::getCombinedVector(const std::string& word,
     return combineVectorsAdditive(word_vec, context_vec);
 }
 
-// PARALLELIZED: Nearest neighbor search with thread-local results
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     const std::string& word, int k) {
     
     std::vector<float> query_vec = computeWordVector(word);
     
-    // Normalize query vector
     float query_norm = 0.0f;
     for (float v : query_vec) query_norm += v * v;
     query_norm = std::sqrt(query_norm);
@@ -466,16 +598,13 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     int vocab_size = word2idx_.size();
     int num_threads = omp_get_max_threads();
     
-    // Thread-local result storage
     std::vector<std::vector<std::pair<std::string, float>>> local_results(num_threads);
     
-    // PARALLELIZED: Compute similarity for all words
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < vocab_size; ++i) {
         int thread_id = omp_get_thread_num();
         auto& local = local_results[thread_id];
         
-        // Get word at index i (need to iterate map)
         auto it = word2idx_.begin();
         std::advance(it, i);
         const std::string& w = it->first;
@@ -483,32 +612,27 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
         
         const std::vector<float>& word_vec = input_matrix_[idx];
         
-        // Compute word vector magnitude
         float word_norm = 0.0f;
         for (float v : word_vec) word_norm += v * v;
         word_norm = std::sqrt(word_norm);
         
         if (word_norm < 1e-8f) continue;
         
-        // Compute dot product
         float dot = 0.0f;
         for (int j = 0; j < dim_; ++j) {
             dot += query_vec[j] * word_vec[j];
         }
         
-        // Cosine similarity
         float similarity = dot / word_norm;
         local.emplace_back(w, similarity);
     }
     
-    // Merge results (single-threaded)
     std::vector<std::pair<std::string, float>> results;
     results.reserve(vocab_size);
     for (const auto& local : local_results) {
         results.insert(results.end(), local.begin(), local.end());
     }
     
-    // Sort and get top-k
     std::partial_sort(results.begin(), results.begin() + std::min(k, static_cast<int>(results.size())), 
                       results.end(),
                       [](const auto& a, const auto& b) { return a.second > b.second; });

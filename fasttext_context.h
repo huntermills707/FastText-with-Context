@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <queue>
 #include <omp.h>
+#include <cstdint>
 
 namespace fasttext {
 
@@ -37,12 +38,24 @@ public:
     ~FastTextContext();
     
     void train(const std::string& filename);
+    
+    // Persistence
+    void saveModel(const std::string& filename) const;
+    void loadModel(const std::string& filename);
+    
+    // Inference
     std::vector<float> getWordVector(const std::string& word);
     std::vector<float> getContextVector(const std::string& context_field);
     std::vector<float> getCombinedVector(const std::string& word, 
                                          const std::vector<std::string>& contexts);
     std::vector<std::pair<std::string, float>> getNearestNeighbors(
         const std::string& word, int k = 10);
+    
+    // Accessors for CLI
+    int getDim() const { return dim_; }
+    int getMinN() const { return min_n_; }
+    int getMaxN() const { return max_n_; }
+    int getThreshold() const { return threshold_; }
     
 private:
     int dim_;
@@ -71,7 +84,6 @@ private:
     std::uniform_real_distribution<float> uniform_;
     std::normal_distribution<float> normal_;
     
-    // Thread-local gradient buffers for training
     std::vector<std::vector<std::vector<float>>> thread_local_grads_;
     int num_threads_;
     
