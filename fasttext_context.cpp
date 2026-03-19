@@ -1,13 +1,15 @@
 #include "fasttext_context.h"
 #include <iostream>
 #include <functional>
+#include <cstring>
 
 namespace fasttext {
 
 FastTextContext::FastTextContext(int dim, int epoch, float lr, int min_n, int max_n, int threshold)
     : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n), 
       threshold_(threshold), huffman_root_(nullptr),
-      rng_(std::random_device{}()), uniform_(0.0, 1.0), normal_(0.0, 1.0) {}
+      rng_(std::random_device{}()), uniform_(0.0, 1.0), normal_(0.0, 1.0),
+      num_threads_(omp_get_max_threads()) {}
 
 FastTextContext::~FastTextContext() {
     cleanupHuffmanTree(huffman_root_);
@@ -101,20 +103,17 @@ void FastTextContext::buildHuffmanTree() {
     int vocab_size = word2idx_.size();
     if (vocab_size == 0) return;
     
-    // Create priority queue of nodes
     auto cmp = [](HuffmanNode* a, HuffmanNode* b) {
-        return a->frequency > b->frequency;  // Min-heap
+        return a->frequency > b->frequency;
     };
     std::priority_queue<HuffmanNode*, std::vector<HuffmanNode*>, decltype(cmp)> pq(cmp);
     
-    // Create leaf nodes for each word
     std::vector<HuffmanNode*> nodes(vocab_size);
     for (int i = 0; i < vocab_size; ++i) {
         nodes[i] = new HuffmanNode(i, word_freqs_[i]);
         pq.push(nodes[i]);
     }
     
-    // Build tree by combining lowest frequency nodes
     while (pq.size() > 1) {
         HuffmanNode* left = pq.top(); pq.pop();
         HuffmanNode* right = pq.top(); pq.pop();
@@ -127,7 +126,6 @@ void FastTextContext::buildHuffmanTree() {
     
     huffman_root_ = pq.top();
     
-    // Generate codes for each word
     word_codes_.resize(vocab_size);
     word_paths_.resize(vocab_size);
     
@@ -149,17 +147,14 @@ void FastTextContext::generateCodes(HuffmanNode* node, std::vector<int>& code,
     if (node == nullptr) return;
     
     if (node->word_idx >= 0) {
-        // Leaf node - store the code and path
         word_codes_[node->word_idx] = code;
         word_paths_[node->word_idx] = path;
         return;
     }
     
-    // Internal node - traverse children
     int path_idx = path.size();
     path.push_back(path_idx);
     
-    // Left child = 0, Right child = 1
     code.push_back(0);
     generateCodes(node->left, code, path, path_nodes);
     code.pop_back();
@@ -176,47 +171,61 @@ void FastTextContext::initializeMatrices() {
     int context_vocab_size = context2idx_.size();
     int ngram_buckets = 2000000;
     
-    // Word input matrix
-    input_matrix_.resize(vocab_size);
-    for (auto& vec : input_matrix_) {
-        vec.resize(dim_);
-        for (float& v : vec) {
-            v = normal_(rng_) / dim_;
-        }
-    }
-    
-    // Output matrix for hierarchical softmax (internal nodes)
-    // Number of internal nodes = vocab_size - 1
+    // Initialize thread-local gradient buffers
+    thread_local_grads_.resize(num_threads_);
     int num_internal_nodes = std::max(1, vocab_size - 1);
-    output_matrix_.resize(num_internal_nodes);
-    for (auto& vec : output_matrix_) {
-        vec.resize(dim_);
-        for (float& v : vec) {
-            v = normal_(rng_) / dim_;
+    for (int t = 0; t < num_threads_; ++t) {
+        thread_local_grads_[t].resize(num_internal_nodes);
+        for (auto& vec : thread_local_grads_[t]) {
+            vec.resize(dim_, 0.0f);
         }
     }
     
-    // N-gram matrix
+    // Word input matrix - PARALLELIZED
+    input_matrix_.resize(vocab_size);
+    #pragma omp parallel for
+    for (int i = 0; i < vocab_size; ++i) {
+        input_matrix_[i].resize(dim_);
+        for (int j = 0; j < dim_; ++j) {
+            input_matrix_[i][j] = normal_(rng_) / dim_;
+        }
+    }
+    
+    // Output matrix - PARALLELIZED
+    int num_internal_nodes_out = std::max(1, vocab_size - 1);
+    output_matrix_.resize(num_internal_nodes_out);
+    #pragma omp parallel for
+    for (int i = 0; i < num_internal_nodes_out; ++i) {
+        output_matrix_[i].resize(dim_);
+        for (int j = 0; j < dim_; ++j) {
+            output_matrix_[i][j] = normal_(rng_) / dim_;
+        }
+    }
+    
+    // N-gram matrix - PARALLELIZED (largest)
     ngram_matrix_.resize(ngram_buckets);
-    for (auto& vec : ngram_matrix_) {
-        vec.resize(dim_);
-        for (float& v : vec) {
-            v = normal_(rng_) / dim_;
+    #pragma omp parallel for
+    for (int i = 0; i < ngram_buckets; ++i) {
+        ngram_matrix_[i].resize(dim_);
+        for (int j = 0; j < dim_; ++j) {
+            ngram_matrix_[i][j] = normal_(rng_) / dim_;
         }
     }
     
-    // Context matrix
+    // Context matrix - PARALLELIZED
     context_matrix_.resize(context_vocab_size);
-    for (auto& vec : context_matrix_) {
-        vec.resize(dim_);
-        for (float& v : vec) {
-            v = normal_(rng_) / dim_;
+    #pragma omp parallel for
+    for (int i = 0; i < context_vocab_size; ++i) {
+        context_matrix_[i].resize(dim_);
+        for (int j = 0; j < dim_; ++j) {
+            context_matrix_[i][j] = normal_(rng_) / dim_;
         }
     }
     
     std::cout << "Word embeddings: " << vocab_size << " x " << dim_ << std::endl;
-    std::cout << "Hierarchical softmax nodes: " << num_internal_nodes << " x " << dim_ << std::endl;
+    std::cout << "Hierarchical softmax nodes: " << num_internal_nodes_out << " x " << dim_ << std::endl;
     std::cout << "Context embeddings: " << context_vocab_size << " x " << dim_ << std::endl;
+    std::cout << "OpenMP threads: " << num_threads_ << std::endl;
 }
 
 std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
@@ -238,6 +247,7 @@ std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
 std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
     std::vector<float> vec(dim_, 0.0f);
     
+    // Add word embedding
     if (word2idx_.count(word)) {
         int idx = word2idx_[word];
         for (int i = 0; i < dim_; ++i) {
@@ -245,11 +255,26 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
         }
     }
     
+    // Add n-gram embeddings
     auto ngram_indices = getNgramIndices(word);
-    for (int idx : ngram_indices) {
-        for (int i = 0; i < dim_; ++i) {
-            vec[i] += ngram_matrix_[idx][i];
+    if (!ngram_indices.empty()) {
+        // Use a raw array for OpenMP reduction
+        float* reduction_buffer = new float[dim_](); // Zero-initialized
+        
+        #pragma omp parallel for reduction(+:reduction_buffer[:dim_])
+        for (int n = 0; n < static_cast<int>(ngram_indices.size()); ++n) {
+            int idx = ngram_indices[n];
+            for (int i = 0; i < dim_; ++i) {
+                reduction_buffer[i] += ngram_matrix_[idx][i];
+            }
         }
+        
+        // Accumulate results
+        for (int i = 0; i < dim_; ++i) {
+            vec[i] += reduction_buffer[i];
+        }
+        
+        delete[] reduction_buffer;
     }
     
     return vec;
@@ -288,37 +313,53 @@ std::vector<float> FastTextContext::combineVectorsAdditive(
     return combined;
 }
 
+void FastTextContext::mergeThreadLocalGradients() {
+    int num_internal_nodes = output_matrix_.size();
+    
+    #pragma omp parallel for
+    for (int node = 0; node < num_internal_nodes; ++node) {
+        for (int j = 0; j < dim_; ++j) {
+            float sum = 0.0f;
+            for (int t = 0; t < num_threads_; ++t) {
+                sum += thread_local_grads_[t][node][j];
+            }
+            output_matrix_[node][j] += sum;
+        }
+    }
+    
+    // Reset thread-local buffers
+    for (int t = 0; t < num_threads_; ++t) {
+        for (auto& vec : thread_local_grads_[t]) {
+            std::fill(vec.begin(), vec.end(), 0.0f);
+        }
+    }
+}
+
 void FastTextContext::hierarchicalSoftmax(const std::vector<float>& combined_input,
                                           int target_word_idx,
                                           float grad_scale) {
-    // Get the path to the target word in the Huffman tree
     const std::vector<int>& path = word_paths_[target_word_idx];
     const std::vector<int>& code = word_codes_[target_word_idx];
     
-    // Traverse the path and update weights
+    int thread_id = omp_get_thread_num();
+    
     for (size_t i = 0; i < path.size(); ++i) {
         int node_idx = path[i];
-        int direction = code[i];  // 0 = left, 1 = right
+        int direction = code[i];
         
-        // Sigmoid activation
         float dot = 0.0f;
         for (int j = 0; j < dim_; ++j) {
             dot += output_matrix_[node_idx][j] * combined_input[j];
         }
         
-        // Clamp to prevent overflow
         dot = std::max(-20.0f, std::min(20.0f, dot));
         float sigmoid = 1.0f / (1.0f + std::exp(-dot));
-        
-        // Target: if direction == 0, we want sigmoid close to 1
-        //         if direction == 1, we want sigmoid close to 0
         float target = (direction == 0) ? 1.0f : 0.0f;
         float error = target - sigmoid;
         
-        // Update output weights
+        // Accumulate to thread-local buffer (no lock needed)
         for (int j = 0; j < dim_; ++j) {
-            float grad = grad_scale * error * combined_input[j];
-            output_matrix_[node_idx][j] += lr_ * grad;
+            thread_local_grads_[thread_id][node_idx][j] += lr_ * error * combined_input[j];
         }
     }
 }
@@ -331,13 +372,17 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
     
     std::cout << "Training on " << total_words << " words across " 
               << samples.size() << " samples..." << std::endl;
-    
+    std::cout << "Using " << num_threads_ << " OpenMP threads with thread-local gradients" << std::endl;
+   
     for (int epoch = 0; epoch < epoch_; ++epoch) {
         int word_count = 0;
         
-        for (const auto& sample : samples) {
+        #pragma omp parallel for schedule(static) reduction(+:word_count)
+        for (int s = 0; s < static_cast<int>(samples.size()); ++s) {
+            const auto& sample = samples[s];
             if (sample.words.empty()) continue;
             
+            int thread_id = omp_get_thread_num();
             std::vector<float> context_vec = computeContextVector(sample.context_fields);
             
             for (size_t i = 0; i < sample.words.size(); ++i) {
@@ -345,23 +390,21 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
                 if (!word2idx_.count(word)) continue;
                 
                 int target_idx = word2idx_[word];
-                
                 std::vector<float> word_vec = computeWordVector(word);
                 std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
                 
-                // Hierarchical softmax update
                 hierarchicalSoftmax(combined, target_idx, 1.0f);
                 
                 word_count++;
             }
-            
-            if (word_count % 10000 == 0) {
-                float progress = static_cast<float>(word_count) / total_words;
-                std::cout << "\rProgress: " << (progress * 100) << "%" 
-                          << " (epoch " << (epoch + 1) << "/" << epoch_ << ")" 
-                          << std::flush;
-            }
         }
+
+        mergeThreadLocalGradients();
+        
+        float progress = static_cast<float>(word_count) / total_words;
+        std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ 
+                  << " | Progress: " << (progress * 100) << "%" 
+                  << " | Words processed: " << word_count << std::flush;
         std::cout << std::endl;
     }
 }
@@ -402,46 +445,73 @@ std::vector<float> FastTextContext::getCombinedVector(const std::string& word,
     return combineVectorsAdditive(word_vec, context_vec);
 }
 
+// PARALLELIZED: Nearest neighbor search with thread-local results
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     const std::string& word, int k) {
     
     std::vector<float> query_vec = computeWordVector(word);
-    std::vector<std::pair<std::string, float>> results;
     
-    // Compute query vector magnitude
+    // Normalize query vector
     float query_norm = 0.0f;
     for (float v : query_vec) query_norm += v * v;
     query_norm = std::sqrt(query_norm);
     
     if (query_norm < 1e-8f) {
         std::cerr << "Warning: Query vector has near-zero magnitude" << std::endl;
-        return results;
+        return {};
     }
     
-    // Normalize query vector
     for (float& v : query_vec) v /= query_norm;
     
-    // Compute cosine similarity with all words
-    for (const auto& [w, idx] : word2idx_) {
+    int vocab_size = word2idx_.size();
+    int num_threads = omp_get_max_threads();
+    
+    // Thread-local result storage
+    std::vector<std::vector<std::pair<std::string, float>>> local_results(num_threads);
+    
+    // PARALLELIZED: Compute similarity for all words
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < vocab_size; ++i) {
+        int thread_id = omp_get_thread_num();
+        auto& local = local_results[thread_id];
+        
+        // Get word at index i (need to iterate map)
+        auto it = word2idx_.begin();
+        std::advance(it, i);
+        const std::string& w = it->first;
+        int idx = it->second;
+        
         const std::vector<float>& word_vec = input_matrix_[idx];
         
+        // Compute word vector magnitude
         float word_norm = 0.0f;
         for (float v : word_vec) word_norm += v * v;
         word_norm = std::sqrt(word_norm);
         
         if (word_norm < 1e-8f) continue;
         
+        // Compute dot product
         float dot = 0.0f;
-        for (int i = 0; i < dim_; ++i) {
-            dot += query_vec[i] * word_vec[i];
+        for (int j = 0; j < dim_; ++j) {
+            dot += query_vec[j] * word_vec[j];
         }
         
+        // Cosine similarity
         float similarity = dot / word_norm;
-        results.emplace_back(w, similarity);
+        local.emplace_back(w, similarity);
     }
     
-    std::sort(results.begin(), results.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    // Merge results (single-threaded)
+    std::vector<std::pair<std::string, float>> results;
+    results.reserve(vocab_size);
+    for (const auto& local : local_results) {
+        results.insert(results.end(), local.begin(), local.end());
+    }
+    
+    // Sort and get top-k
+    std::partial_sort(results.begin(), results.begin() + std::min(k, static_cast<int>(results.size())), 
+                      results.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
     
     if (results.size() > static_cast<size_t>(k)) {
         results.resize(k);

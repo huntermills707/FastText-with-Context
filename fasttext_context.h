@@ -10,6 +10,7 @@
 #include <cmath>
 #include <algorithm>
 #include <queue>
+#include <omp.h>
 
 namespace fasttext {
 
@@ -33,7 +34,7 @@ public:
     FastTextContext(int dim = 100, int epoch = 5, float lr = 0.05,
                    int min_n = 3, int max_n = 6, int threshold = 10);
     
-    ~FastTextContext();  // Clean up Huffman tree
+    ~FastTextContext();
     
     void train(const std::string& filename);
     std::vector<float> getWordVector(const std::string& word);
@@ -51,20 +52,17 @@ private:
     int max_n_;
     int threshold_;
     
-    // Word embeddings
     std::unordered_map<std::string, int> word2idx_;
     std::vector<std::vector<float>> input_matrix_;
-    std::vector<std::vector<float>> output_matrix_;  // Hierarchical softmax weights
+    std::vector<std::vector<float>> output_matrix_;
     std::vector<std::vector<float>> ngram_matrix_;
     
-    // Context embeddings
     std::unordered_map<std::string, int> context2idx_;
     std::vector<std::vector<float>> context_matrix_;
     
-    // Huffman tree for hierarchical softmax
     HuffmanNode* huffman_root_;
-    std::vector<std::vector<int>> word_codes_;      // Binary codes for each word
-    std::vector<std::vector<int>> word_paths_;      // Path indices for each word
+    std::vector<std::vector<int>> word_codes_;
+    std::vector<std::vector<int>> word_paths_;
     std::vector<double> word_freqs_;
     
     std::vector<int> word_counts_;
@@ -73,7 +71,10 @@ private:
     std::uniform_real_distribution<float> uniform_;
     std::normal_distribution<float> normal_;
     
-    // Methods
+    // Thread-local gradient buffers for training
+    std::vector<std::vector<std::vector<float>>> thread_local_grads_;
+    int num_threads_;
+    
     uint64_t hash(const std::string& str);
     std::vector<TrainingSample> parseFile(const std::string& filename);
     void buildVocab(const std::vector<TrainingSample>& samples);
@@ -91,6 +92,7 @@ private:
                             int target_word_idx,
                             float grad_scale);
     void cleanupHuffmanTree(HuffmanNode* node);
+    void mergeThreadLocalGradients();
 };
 
 } // namespace fasttext
