@@ -46,10 +46,16 @@ public:
     // Inference
     std::vector<float> getWordVector(const std::string& word);
     std::vector<float> getContextVector(const std::string& context_field);
-    std::vector<float> getCombinedVector(const std::string& word, 
+    
+    // NEW: Batch vector computation
+    std::vector<float> getCombinedVector(const std::vector<std::string>& words, 
                                          const std::vector<std::string>& contexts);
+    
+    // UPDATED: Accept vectors of words and contexts
     std::vector<std::pair<std::string, float>> getNearestNeighbors(
-        const std::string& word, int k = 10);
+        const std::vector<std::string>& words, 
+        const std::vector<std::string>& contexts, 
+        int k = 10);
     
     // Accessors for CLI
     int getDim() const { return dim_; }

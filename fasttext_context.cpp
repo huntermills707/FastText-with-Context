@@ -572,34 +572,64 @@ std::vector<float> FastTextContext::getContextVector(const std::string& context_
     return vec;
 }
 
-std::vector<float> FastTextContext::getCombinedVector(const std::string& word,
-                                                       const std::vector<std::string>& contexts) {
-    std::vector<float> word_vec = computeWordVector(word);
-    std::vector<float> context_vec = computeContextVector(contexts);
-    return combineVectorsAdditive(word_vec, context_vec);
+std::vector<float> FastTextContext::getCombinedVector(const std::vector<std::string>& words, 
+                                                      const std::vector<std::string>& contexts) {
+    std::vector<float> combined_vec(dim_, 0.0f);
+    
+    // Sum all word vectors
+    for (const auto& word : words) {
+        std::vector<float> w_vec = computeWordVector(word);
+        for (int i = 0; i < dim_; ++i) {
+            combined_vec[i] += w_vec[i];
+        }
+    }
+    
+    // Sum all context vectors
+    std::vector<float> ctx_vec = computeContextVector(contexts);
+    for (int i = 0; i < dim_; ++i) {
+        combined_vec[i] += ctx_vec[i];
+    }
+    
+    // Normalize the final sum
+    float norm = 0.0f;
+    for (float v : combined_vec) norm += v * v;
+    norm = std::sqrt(norm);
+    
+    if (norm > 1e-8f) {
+        for (float& v : combined_vec) v /= norm;
+    }
+    
+    return combined_vec;
 }
 
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
-    const std::string& word, int k) {
+    const std::vector<std::string>& words, 
+    const std::vector<std::string>& contexts, 
+    int k) {
     
-    std::vector<float> query_vec = computeWordVector(word);
+    // Compute the query vector by summing all inputs
+    std::vector<float> query_vec = getCombinedVector(words, contexts);
     
+    // Check for zero vector
     float query_norm = 0.0f;
     for (float v : query_vec) query_norm += v * v;
     query_norm = std::sqrt(query_norm);
     
     if (query_norm < 1e-8f) {
-        std::cerr << "Warning: Query vector has near-zero magnitude" << std::endl;
+        std::cerr << "Warning: Query vector has near-zero magnitude. Check inputs." << std::endl;
         return {};
     }
     
+    // Already normalized in getCombinedVector, but safe to ensure
     for (float& v : query_vec) v /= query_norm;
     
     int vocab_size = word2idx_.size();
     int num_threads = omp_get_max_threads();
     
+    // Thread-local results
     std::vector<std::vector<std::pair<std::string, float>>> local_results(num_threads);
     
+    // Parallel search
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < vocab_size; ++i) {
         int thread_id = omp_get_thread_num();
@@ -627,6 +657,7 @@ std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
         local.emplace_back(w, similarity);
     }
     
+    // Merge and sort
     std::vector<std::pair<std::string, float>> results;
     results.reserve(vocab_size);
     for (const auto& local : local_results) {
