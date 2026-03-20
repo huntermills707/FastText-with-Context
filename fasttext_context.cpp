@@ -181,7 +181,7 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Word input matrix - PARALLELIZED
+    // Word input matrix
     input_matrix_.resize(vocab_size);
     #pragma omp parallel for
     for (int i = 0; i < vocab_size; ++i) {
@@ -191,7 +191,7 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Output matrix - PARALLELIZED
+    // Output matrix
     int num_internal_nodes_out = std::max(1, vocab_size - 1);
     output_matrix_.resize(num_internal_nodes_out);
     #pragma omp parallel for
@@ -202,7 +202,7 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // N-gram matrix - PARALLELIZED (largest)
+    // N-gram matrix
     ngram_matrix_.resize(ngram_buckets);
     #pragma omp parallel for
     for (int i = 0; i < ngram_buckets; ++i) {
@@ -212,7 +212,7 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Context matrix - PARALLELIZED
+    // Context matrix
     context_matrix_.resize(context_vocab_size);
     #pragma omp parallel for
     for (int i = 0; i < context_vocab_size; ++i) {

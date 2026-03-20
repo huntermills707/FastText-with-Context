@@ -47,11 +47,11 @@ public:
     std::vector<float> getWordVector(const std::string& word);
     std::vector<float> getContextVector(const std::string& context_field);
     
-    // NEW: Batch vector computation
+    // Batch vector computation
     std::vector<float> getCombinedVector(const std::vector<std::string>& words, 
                                          const std::vector<std::string>& contexts);
     
-    // UPDATED: Accept vectors of words and contexts
+    // Accept vectors of words and contexts
     std::vector<std::pair<std::string, float>> getNearestNeighbors(
         const std::vector<std::string>& words, 
         const std::vector<std::string>& contexts, 
