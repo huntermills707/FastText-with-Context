@@ -2,6 +2,7 @@
 #include <iostream>
 #include <functional>
 #include <cstring>
+#include <iomanip> 
 
 namespace fasttext {
 
@@ -360,6 +361,7 @@ void FastTextContext::hierarchicalSoftmax(const std::vector<float>& combined_inp
     }
 }
 
+
 void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
     int total_words = 0;
     for (const auto& sample : samples) {
@@ -369,9 +371,19 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
     std::cout << "Training on " << total_words << " words across " 
               << samples.size() << " samples..." << std::endl;
     std::cout << "Using " << num_threads_ << " OpenMP threads with thread-local gradients" << std::endl;
+    std::cout << "Merge interval: every 100,000 samples" << std::endl;
+    
+    const int MERGE_INTERVAL = 100000;
+    const int PROGRESS_UPDATE_INTERVAL = 10000;
+    const int BAR_WIDTH = 40;
     
     for (int epoch = 0; epoch < epoch_; ++epoch) {
         int word_count = 0;
+        int samples_processed = 0;
+        int last_progress_update = 0;
+        
+        std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | " 
+                  << std::string(BAR_WIDTH, ' ') << " | 0.00%" << std::flush;
         
         #pragma omp parallel for schedule(static) reduction(+:word_count)
         for (int s = 0; s < static_cast<int>(samples.size()); ++s) {
@@ -389,19 +401,51 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
                 std::vector<float> word_vec = computeWordVector(word);
                 std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
                 
+                // Accumulate gradients locally (no lock)
                 hierarchicalSoftmax(combined, target_idx, 1.0f);
+                
                 word_count++;
+            }
+            
+            // Track samples processed (thread-local counter)
+            #pragma omp atomic
+            samples_processed++;
+            
+            // Update progress bar periodically
+            if (samples_processed - last_progress_update >= PROGRESS_UPDATE_INTERVAL) {
+                #pragma omp critical
+                {
+                    float progress = static_cast<float>(samples_processed) / samples.size();
+                    int filled_width = static_cast<int>(BAR_WIDTH * progress);
+                    
+                    std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | "
+                              << "[" << std::string(filled_width, '#') 
+                              << std::string(BAR_WIDTH - filled_width, ' ') << "] "
+                              << std::fixed << std::setprecision(2) << (progress * 100) << "%"
+                              << std::flush;
+                    
+                    last_progress_update = samples_processed;
+                }
+            }
+            
+            // Merge gradients every MERGE_INTERVAL samples
+            if (samples_processed % MERGE_INTERVAL == 0) {
+                #pragma omp critical
+                mergeThreadLocalGradients();
             }
         }
         
+        // Final merge at end of epoch
+        #pragma omp critical
         mergeThreadLocalGradients();
         
-        float progress = static_cast<float>(word_count) / total_words;
-        std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ 
-                  << " | Progress: " << (progress * 100) << "%" 
-                  << " | Words processed: " << word_count << std::flush;
-        std::cout << std::endl;
+        // Clear the progress line and show completion
+        std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | " 
+                  << "[" << std::string(BAR_WIDTH, '#') << "] 100.00%"
+                  << " | Done!" << std::endl;
     }
+    
+    std::cout << "\nTraining complete!" << std::endl;
 }
 
 void FastTextContext::train(const std::string& filename) {
@@ -412,8 +456,7 @@ void FastTextContext::train(const std::string& filename) {
     buildHuffmanTree();
     initializeMatrices();
     trainModel(samples);
-    
-    std::cout << "Training complete!" << std::endl;
+
 }
 
 void FastTextContext::saveModel(const std::string& filename) const {
