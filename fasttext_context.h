@@ -15,7 +15,7 @@
 
 namespace fasttext {
 
-struct TrainingSample {
+struct StreamingSample {
     std::vector<std::string> context_fields;
     std::vector<std::string> words;
 };
@@ -33,31 +33,25 @@ struct HuffmanNode {
 class FastTextContext {
 public:
     FastTextContext(int dim = 100, int epoch = 5, float lr = 0.05,
-                   int min_n = 3, int max_n = 6, int threshold = 10);
+                   int min_n = 3, int max_n = 6, int threshold = 10,
+                   int merge_interval = 100000, int chunk_size = 10000);
     
     ~FastTextContext();
     
-    void train(const std::string& filename);
+    void trainStreaming(const std::string& filename);
     
-    // Persistence
     void saveModel(const std::string& filename) const;
     void loadModel(const std::string& filename);
     
-    // Inference
     std::vector<float> getWordVector(const std::string& word);
     std::vector<float> getContextVector(const std::string& context_field);
-    
-    // Batch vector computation
     std::vector<float> getCombinedVector(const std::vector<std::string>& words, 
                                          const std::vector<std::string>& contexts);
-    
-    // Accept vectors of words and contexts
     std::vector<std::pair<std::string, float>> getNearestNeighbors(
         const std::vector<std::string>& words, 
         const std::vector<std::string>& contexts, 
         int k = 10);
     
-    // Accessors for CLI
     int getDim() const { return dim_; }
     int getMinN() const { return min_n_; }
     int getMaxN() const { return max_n_; }
@@ -70,6 +64,8 @@ private:
     int min_n_;
     int max_n_;
     int threshold_;
+    int merge_interval_;
+    int chunk_size_;
     
     std::unordered_map<std::string, int> word2idx_;
     std::vector<std::vector<float>> input_matrix_;
@@ -94,13 +90,16 @@ private:
     int num_threads_;
     
     uint64_t hash(const std::string& str);
-    std::vector<TrainingSample> parseFile(const std::string& filename);
-    void buildVocab(const std::vector<TrainingSample>& samples);
+    void countVocabulary(const std::string& filename, 
+                        std::unordered_map<std::string, int>& word_freq,
+                        std::unordered_map<std::string, int>& context_freq);
+    void buildVocabFromCounts(const std::unordered_map<std::string, int>& word_freq,
+                             const std::unordered_map<std::string, int>& context_freq);
     void buildHuffmanTree();
     void generateCodes(HuffmanNode* node, std::vector<int>& code, 
                        std::vector<int>& path, std::vector<int>& path_nodes);
     void initializeMatrices();
-    void trainModel(const std::vector<TrainingSample>& samples);
+    void trainModelStreaming(const std::string& filename);
     std::vector<int> getNgramIndices(const std::string& word);
     std::vector<float> computeWordVector(const std::string& word);
     std::vector<float> computeContextVector(const std::vector<std::string>& contexts);
@@ -108,9 +107,13 @@ private:
                                               const std::vector<float>& context_vec);
     void hierarchicalSoftmax(const std::vector<float>& combined_input,
                             int target_word_idx,
-                            float grad_scale);
+                            float grad_scale);  // grad_scale now carries the current LR
     void cleanupHuffmanTree(HuffmanNode* node);
     void mergeThreadLocalGradients();
+    bool parseNextSample(std::ifstream& file, StreamingSample& sample);
+    
+    void diagnoseVocabulary();
+    void diagnoseHuffmanTree();
 };
 
 } // namespace fasttext

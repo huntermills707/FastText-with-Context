@@ -2,13 +2,16 @@
 #include <iostream>
 #include <functional>
 #include <cstring>
-#include <iomanip> 
+#include <iomanip>
+#include <numeric>
 
 namespace fasttext {
 
-FastTextContext::FastTextContext(int dim, int epoch, float lr, int min_n, int max_n, int threshold)
+FastTextContext::FastTextContext(int dim, int epoch, float lr, int min_n, int max_n, 
+                                  int threshold, int merge_interval, int chunk_size)
     : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n), 
-      threshold_(threshold), huffman_root_(nullptr),
+      threshold_(threshold), merge_interval_(merge_interval), chunk_size_(chunk_size),
+      huffman_root_(nullptr),
       rng_(std::random_device{}()), uniform_(0.0, 1.0), normal_(0.0, 1.0),
       num_threads_(omp_get_max_threads()) {}
 
@@ -32,62 +35,96 @@ uint64_t FastTextContext::hash(const std::string& str) {
     return h;
 }
 
-std::vector<TrainingSample> FastTextContext::parseFile(const std::string& filename) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        throw std::runtime_error("Cannot open file: " + filename);
+// DIAGNOSTIC: Check vocabulary state
+void FastTextContext::diagnoseVocabulary() {
+    std::cout << "\n=== VOCABULARY DIAGNOSTICS ===" << std::endl;
+    std::cout << "word2idx_ size: " << word2idx_.size() << std::endl;
+    std::cout << "word_freqs_ size: " << word_freqs_.size() << std::endl;
+    std::cout << "word_counts_ size: " << word_counts_.size() << std::endl;
+    std::cout << "Threshold: " << threshold_ << std::endl;
+    
+    if (!word_freqs_.empty()) {
+        double min_freq = *std::min_element(word_freqs_.begin(), word_freqs_.end());
+        double max_freq = *std::max_element(word_freqs_.begin(), word_freqs_.end());
+        double avg_freq = std::accumulate(word_freqs_.begin(), word_freqs_.end(), 0.0) / word_freqs_.size();
+        
+        std::cout << "Word frequency stats:" << std::endl;
+        std::cout << "  Min: " << min_freq << std::endl;
+        std::cout << "  Max: " << max_freq << std::endl;
+        std::cout << "  Avg: " << avg_freq << std::endl;
     }
     
-    std::vector<TrainingSample> samples;
-    std::string line;
-    
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-        
-        TrainingSample sample;
-        std::stringstream ss(line);
-        std::string field;
-        
-        while (std::getline(ss, field, '|')) {
-            if (ss.eof()) {
-                std::istringstream sentence_stream(field);
-                std::string word;
-                while (sentence_stream >> word) {
-                    sample.words.push_back(word);
-                }
+    if (!word2idx_.empty()) {
+        std::cout << "Sample words in vocabulary:" << std::endl;
+        int count = 0;
+        for (const auto& [word, idx] : word2idx_) {
+            if (count++ < 5) {
+                std::cout << "  '" << word << "' -> idx " << idx << std::endl;
             } else {
-                sample.context_fields.push_back(field);
+                break;
             }
         }
-        
-        if (!sample.words.empty()) {
-            samples.push_back(sample);
-        }
     }
-    
-    file.close();
-    return samples;
+    std::cout << "================================\n" << std::endl;
 }
 
-void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
-    std::unordered_map<std::string, int> word_freq;
-    std::unordered_map<std::string, int> context_freq;
+// DIAGNOSTIC: Check Huffman tree state
+void FastTextContext::diagnoseHuffmanTree() {
+    std::cout << "\n=== HUFFMAN TREE DIAGNOSTICS ===" << std::endl;
+    std::cout << "huffman_root_: " << (huffman_root_ ? "exists" : "NULL") << std::endl;
+    std::cout << "word_codes_ size: " << word_codes_.size() << std::endl;
+    std::cout << "word_paths_ size: " << word_paths_.size() << std::endl;
     
-    for (const auto& sample : samples) {
-        for (const auto& word : sample.words) {
-            word_freq[word]++;
+    if (!word_paths_.empty()) {
+        std::cout << "Path depth statistics:" << std::endl;
+        size_t min_depth = word_paths_[0].size();
+        size_t max_depth = word_paths_[0].size();
+        size_t total_depth = 0;
+        
+        for (const auto& path : word_paths_) {
+            min_depth = std::min(min_depth, path.size());
+            max_depth = std::max(max_depth, path.size());
+            total_depth += path.size();
         }
-        for (const auto& ctx : sample.context_fields) {
-            context_freq[ctx]++;
+        
+        std::cout << "  Min depth: " << min_depth << std::endl;
+        std::cout << "  Max depth: " << max_depth << std::endl;
+        std::cout << "  Avg depth: " << (total_depth / word_paths_.size()) << std::endl;
+        
+        // Check for depth 0 issue
+        if (min_depth == 0) {
+            std::cerr << "  ERROR: Some words have depth 0!" << std::endl;
+            int zero_depth_count = 0;
+            for (const auto& path : word_paths_) {
+                if (path.size() == 0) zero_depth_count++;
+            }
+            std::cerr << "  Words with depth 0: " << zero_depth_count << std::endl;
         }
     }
     
+    if (huffman_root_) {
+        std::cout << "Root node: word_idx=" << huffman_root_->word_idx 
+                  << ", frequency=" << huffman_root_->frequency << std::endl;
+    }
+
+    std::cout << "================================\n" << std::endl;
+}
+   
+
+// PASS 1: Count vocabulary without storing samples
+
+void FastTextContext::buildVocabFromCounts(const std::unordered_map<std::string, int>& word_freq,
+                                          const std::unordered_map<std::string, int>& context_freq) {
     int word_idx = 0;
+    int filtered_count = 0;
+    
     for (const auto& [word, count] : word_freq) {
         if (count >= threshold_) {
             word2idx_[word] = word_idx++;
             word_counts_.push_back(count);
             word_freqs_.push_back(static_cast<double>(count));
+        } else {
+            filtered_count++;
         }
     }
     
@@ -96,13 +133,35 @@ void FastTextContext::buildVocab(const std::vector<TrainingSample>& samples) {
         context2idx_[ctx] = ctx_idx++;
     }
     
-    std::cout << "Word vocabulary: " << word2idx_.size() << std::endl;
-    std::cout << "Context vocabulary: " << context2idx_.size() << std::endl;
+    std::cout << "\n=== VOCABULARY BUILD SUMMARY ===" << std::endl;
+    std::cout << "Total unique words in file: " << word_freq.size() << std::endl;
+    std::cout << "Words meeting threshold (" << threshold_ << "): " << word_idx << std::endl;
+    std::cout << "Words filtered out: " << filtered_count << std::endl;
+    std::cout << "Context fields: " << context2idx_.size() << std::endl;
+    std::cout << "=================================\n" << std::endl;
+    
+    // Run diagnostics
+    diagnoseVocabulary();
 }
 
 void FastTextContext::buildHuffmanTree() {
     int vocab_size = word2idx_.size();
-    if (vocab_size == 0) return;
+    std::cout << "\n=== HUFFMAN TREE CONSTRUCTION ===" << std::endl;
+    std::cout << "Vocabulary size: " << vocab_size << std::endl;
+    
+    if (vocab_size == 0) {
+        std::cerr << "ERROR: No words in vocabulary! Cannot build Huffman tree." << std::endl;
+        return;
+    }
+    
+    if (vocab_size == 1) {
+        std::cerr << "WARNING: Only 1 word in vocabulary. Huffman tree will have depth 0." << std::endl;
+        word_codes_.resize(1);
+        word_paths_.resize(1);
+        word_codes_[0] = {};
+        word_paths_[0] = {};
+        return;
+    }
     
     auto cmp = [](HuffmanNode* a, HuffmanNode* b) {
         return a->frequency > b->frequency;
@@ -115,6 +174,9 @@ void FastTextContext::buildHuffmanTree() {
         pq.push(nodes[i]);
     }
     
+    std::cout << "Priority queue initialized with " << vocab_size << " leaf nodes" << std::endl;
+    
+    int internal_nodes = 0;
     while (pq.size() > 1) {
         HuffmanNode* left = pq.top(); pq.pop();
         HuffmanNode* right = pq.top(); pq.pop();
@@ -123,24 +185,25 @@ void FastTextContext::buildHuffmanTree() {
         parent->left = left;
         parent->right = right;
         pq.push(parent);
+        internal_nodes++;
     }
     
     huffman_root_ = pq.top();
     
+    std::cout << "Tree constructed with " << internal_nodes << " internal nodes" << std::endl;
+    std::cout << "Root node frequency: " << huffman_root_->frequency << std::endl;
+    
     word_codes_.resize(vocab_size);
     word_paths_.resize(vocab_size);
     
-    for (int i = 0; i < vocab_size; ++i) {
-        std::vector<int> code;
-        std::vector<int> path;
-        std::vector<int> path_nodes;
-        generateCodes(nodes[i], code, path, path_nodes);
-        word_codes_[i] = code;
-        word_paths_[i] = path;
-    }
+    std::vector<int> code;
+    std::vector<int> path;
+    std::vector<int> path_nodes;
+    generateCodes(huffman_root_, code, path, path_nodes);  // Changed from nodes[i] to huffman_root_
     
-    std::cout << "Huffman tree built. Max depth: " 
-              << (word_codes_.empty() ? 0 : word_codes_[0].size()) << std::endl;
+    std::cout << "Codes and paths generated for " << vocab_size << " words" << std::endl;
+    diagnoseHuffmanTree();
+    std::cout << "================================\n" << std::endl;
 }
 
 void FastTextContext::generateCodes(HuffmanNode* node, std::vector<int>& code,
@@ -148,6 +211,7 @@ void FastTextContext::generateCodes(HuffmanNode* node, std::vector<int>& code,
     if (node == nullptr) return;
     
     if (node->word_idx >= 0) {
+        // Leaf node - store the code and path
         word_codes_[node->word_idx] = code;
         word_paths_[node->word_idx] = path;
         return;
@@ -167,12 +231,87 @@ void FastTextContext::generateCodes(HuffmanNode* node, std::vector<int>& code,
     path.pop_back();
 }
 
+void FastTextContext::countVocabulary(const std::string& filename, 
+                                     std::unordered_map<std::string, int>& word_freq,
+                                     std::unordered_map<std::string, int>& context_freq) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+    
+    std::string line;
+    int line_count = 0;
+    
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        line_count++;
+        
+        std::stringstream ss(line);
+        std::string field;
+        
+        while (std::getline(ss, field, '|')) {
+            if (ss.eof()) {
+                // Last field is sentence
+                std::istringstream sentence_stream(field);
+                std::string word;
+                while (sentence_stream >> word) {
+                    word_freq[word]++;
+                }
+            } else {
+                // Context fields
+                context_freq[field]++;
+            }
+        }
+        
+        if (line_count % 100000 == 0) {
+            std::cout << "\rCounting vocabulary: " << line_count << " lines..." << std::flush;
+        }
+    }
+    
+    file.close();
+    std::cout << "\nProcessed " << line_count << " lines for vocabulary counting" << std::endl;
+}
+
+bool FastTextContext::parseNextSample(std::ifstream& file, StreamingSample& sample) {
+    std::string line;
+    
+    // Clear the sample for reuse
+    sample.context_fields.clear();
+    sample.words.clear();
+    
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        std::stringstream ss(line);
+        std::string field;
+        
+        while (std::getline(ss, field, '|')) {
+            if (ss.eof()) {
+                // Last field is sentence
+                std::istringstream sentence_stream(field);
+                std::string word;
+                while (sentence_stream >> word) {
+                    sample.words.push_back(word);
+                }
+            } else {
+                // Context fields
+                sample.context_fields.push_back(field);
+            }
+        }
+        
+        if (!sample.words.empty()) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
 void FastTextContext::initializeMatrices() {
     int vocab_size = word2idx_.size();
     int context_vocab_size = context2idx_.size();
     int ngram_buckets = 2000000;
     
-    // Initialize thread-local gradient buffers
     thread_local_grads_.resize(num_threads_);
     int num_internal_nodes = std::max(1, vocab_size - 1);
     for (int t = 0; t < num_threads_; ++t) {
@@ -182,7 +321,6 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Word input matrix
     input_matrix_.resize(vocab_size);
     #pragma omp parallel for
     for (int i = 0; i < vocab_size; ++i) {
@@ -192,18 +330,15 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Output matrix
-    int num_internal_nodes_out = std::max(1, vocab_size - 1);
-    output_matrix_.resize(num_internal_nodes_out);
+    output_matrix_.resize(num_internal_nodes);
     #pragma omp parallel for
-    for (int i = 0; i < num_internal_nodes_out; ++i) {
+    for (int i = 0; i < num_internal_nodes; ++i) {
         output_matrix_[i].resize(dim_);
         for (int j = 0; j < dim_; ++j) {
             output_matrix_[i][j] = normal_(rng_) / dim_;
         }
     }
     
-    // N-gram matrix
     ngram_matrix_.resize(ngram_buckets);
     #pragma omp parallel for
     for (int i = 0; i < ngram_buckets; ++i) {
@@ -213,7 +348,6 @@ void FastTextContext::initializeMatrices() {
         }
     }
     
-    // Context matrix
     context_matrix_.resize(context_vocab_size);
     #pragma omp parallel for
     for (int i = 0; i < context_vocab_size; ++i) {
@@ -224,7 +358,7 @@ void FastTextContext::initializeMatrices() {
     }
     
     std::cout << "Word embeddings: " << vocab_size << " x " << dim_ << std::endl;
-    std::cout << "Hierarchical softmax nodes: " << num_internal_nodes_out << " x " << dim_ << std::endl;
+    std::cout << "Hierarchical softmax nodes: " << num_internal_nodes << " x " << dim_ << std::endl;
     std::cout << "Context embeddings: " << context_vocab_size << " x " << dim_ << std::endl;
     std::cout << "OpenMP threads: " << num_threads_ << std::endl;
 }
@@ -248,7 +382,6 @@ std::vector<int> FastTextContext::getNgramIndices(const std::string& word) {
 std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
     std::vector<float> vec(dim_, 0.0f);
     
-    // Add word embedding
     if (word2idx_.count(word)) {
         int idx = word2idx_[word];
         for (int i = 0; i < dim_; ++i) {
@@ -256,7 +389,6 @@ std::vector<float> FastTextContext::computeWordVector(const std::string& word) {
         }
     }
     
-    // Add n-gram embeddings
     auto ngram_indices = getNgramIndices(word);
     if (!ngram_indices.empty()) {
         float* reduction_buffer = new float[dim_]();
@@ -335,7 +467,7 @@ void FastTextContext::mergeThreadLocalGradients() {
 
 void FastTextContext::hierarchicalSoftmax(const std::vector<float>& combined_input,
                                           int target_word_idx,
-                                          float grad_scale) {
+                                          float grad_scale) {  // grad_scale is now the current LR
     const std::vector<int>& path = word_paths_[target_word_idx];
     const std::vector<int>& code = word_codes_[target_word_idx];
     
@@ -355,29 +487,85 @@ void FastTextContext::hierarchicalSoftmax(const std::vector<float>& combined_inp
         float target = (direction == 0) ? 1.0f : 0.0f;
         float error = target - sigmoid;
         
+        // Use grad_scale (current LR) instead of lr_
         for (int j = 0; j < dim_; ++j) {
-            thread_local_grads_[thread_id][node_idx][j] += lr_ * error * combined_input[j];
+            thread_local_grads_[thread_id][node_idx][j] += grad_scale * error * combined_input[j];
         }
     }
 }
 
-
-void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
-    int total_words = 0;
-    for (const auto& sample : samples) {
-        total_words += sample.words.size();
+// STREAMING TRAINING: Two-pass approach
+void FastTextContext::trainStreaming(const std::string& filename) {
+    std::cout << "=== Streaming Training (Two-Pass) ===" << std::endl;
+    
+    // PASS 1: Count vocabulary
+    std::cout << "\nPass 1/2: Counting vocabulary..." << std::endl;
+    std::unordered_map<std::string, int> word_freq;
+    std::unordered_map<std::string, int> context_freq;
+    countVocabulary(filename, word_freq, context_freq);
+    
+    // Build vocabulary from counts
+    buildVocabFromCounts(word_freq, context_freq);
+    
+    // Build Huffman tree
+    buildHuffmanTree();
+    
+    // Check if tree is valid before proceeding
+    if (word_paths_.empty() || (word_paths_.size() == 1 && word_paths_[0].empty())) {
+        std::cerr << "\nERROR: Huffman tree construction failed or produced invalid paths." << std::endl;
+        std::cerr << "Cannot proceed with training. Check vocabulary diagnostics above." << std::endl;
+        return;
     }
     
-    std::cout << "Training on " << total_words << " words across " 
-              << samples.size() << " samples..." << std::endl;
-    std::cout << "Using " << num_threads_ << " OpenMP threads with thread-local gradients" << std::endl;
-    std::cout << "Merge interval: every 100,000 samples" << std::endl;
+    // Initialize matrices
+    initializeMatrices();
     
-    const int MERGE_INTERVAL = 100000;
-    const int PROGRESS_UPDATE_INTERVAL = 10000;
+    // PASS 2: Train by streaming samples
+    std::cout << "\nPass 2/2: Training by streaming samples..." << std::endl;
+    trainModelStreaming(filename);
+    
+    std::cout << "\nStreaming training complete!" << std::endl;
+}
+
+void FastTextContext::trainModelStreaming(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+    
+    // Count total samples
+    std::cout << "Counting total samples for progress tracking..." << std::endl;
+    std::ifstream count_file(filename);
+    int total_samples = 0;
+    std::string line;
+    while (std::getline(count_file, line)) {
+        if (!line.empty()) total_samples++;
+    }
+    count_file.close();
+    
+    // Total training steps across all epochs
+    long long total_steps = static_cast<long long>(total_samples) * epoch_;
+    
+    std::cout << "Total samples: " << total_samples << std::endl;
+    std::cout << "Total epochs: " << epoch_ << std::endl;
+    std::cout << "Total training steps: " << total_steps << std::endl;
+    std::cout << "Chunk size: " << chunk_size_ << " samples" << std::endl;
+    std::cout << "Merge interval: " << merge_interval_ << " samples" << std::endl;
+    std::cout << "Initial LR: " << lr_ << std::endl;
+    std::cout << "LR Schedule: Linear decay over " << epoch_ << " epochs" << std::endl;
+    
+    const int MERGE_INTERVAL = merge_interval_;
+    const int CHUNK_SIZE = chunk_size_;
+    const int PROGRESS_UPDATE_INTERVAL = 1000;
     const int BAR_WIDTH = 40;
+    const float LR_FLOOR = lr_ * 0.0001f;
+    
+    long long global_step = 0;  // Track across all epochs
     
     for (int epoch = 0; epoch < epoch_; ++epoch) {
+        file.clear();
+        file.seekg(0, std::ios::beg);
+        
         int word_count = 0;
         int samples_processed = 0;
         int last_progress_update = 0;
@@ -385,78 +573,114 @@ void FastTextContext::trainModel(const std::vector<TrainingSample>& samples) {
         std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | " 
                   << std::string(BAR_WIDTH, ' ') << " | 0.00%" << std::flush;
         
-        #pragma omp parallel for schedule(static) reduction(+:word_count)
-        for (int s = 0; s < static_cast<int>(samples.size()); ++s) {
-            const auto& sample = samples[s];
-            if (sample.words.empty()) continue;
+        std::vector<StreamingSample> chunk;
+        chunk.reserve(CHUNK_SIZE);
+        StreamingSample sample;
+        
+        while (parseNextSample(file, sample)) {
+            chunk.push_back(std::move(sample));
             
-            int thread_id = omp_get_thread_num();
-            std::vector<float> context_vec = computeContextVector(sample.context_fields);
-            
-            for (size_t i = 0; i < sample.words.size(); ++i) {
-                std::string word = sample.words[i];
-                if (!word2idx_.count(word)) continue;
+            if (chunk.size() >= CHUNK_SIZE) {
+                // CORRECT: Global progress across all epochs
+                float progress = static_cast<float>(global_step) / total_steps;
+                float current_lr = lr_ * (1.0f - progress);
+                current_lr = std::max(current_lr, LR_FLOOR);
                 
-                int target_idx = word2idx_[word];
-                std::vector<float> word_vec = computeWordVector(word);
-                std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
-                
-                // Accumulate gradients locally (no lock)
-                hierarchicalSoftmax(combined, target_idx, 1.0f);
-                
-                word_count++;
-            }
-            
-            // Track samples processed (thread-local counter)
-            #pragma omp atomic
-            samples_processed++;
-            
-            // Update progress bar periodically
-            if (samples_processed - last_progress_update >= PROGRESS_UPDATE_INTERVAL) {
-                #pragma omp critical
-                {
-                    float progress = static_cast<float>(samples_processed) / samples.size();
-                    int filled_width = static_cast<int>(BAR_WIDTH * progress);
+                #pragma omp parallel for schedule(dynamic) reduction(+:word_count)
+                for (int s = 0; s < static_cast<int>(chunk.size()); ++s) {
+                    const auto& current_sample = chunk[s];
+                    if (current_sample.words.empty()) continue;
                     
-                    std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | "
-                              << "[" << std::string(filled_width, '#') 
-                              << std::string(BAR_WIDTH - filled_width, ' ') << "] "
-                              << std::fixed << std::setprecision(2) << (progress * 100) << "%"
-                              << std::flush;
+                    std::vector<float> context_vec = computeContextVector(current_sample.context_fields);
                     
-                    last_progress_update = samples_processed;
+                    for (size_t i = 0; i < current_sample.words.size(); ++i) {
+                        std::string word = current_sample.words[i];
+                        if (!word2idx_.count(word)) continue;
+                        
+                        int target_idx = word2idx_[word];
+                        std::vector<float> word_vec = computeWordVector(word);
+                        std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
+                        
+                        hierarchicalSoftmax(combined, target_idx, current_lr);
+                        word_count++;
+                    }
                 }
-            }
-            
-            // Merge gradients every MERGE_INTERVAL samples
-            if (samples_processed % MERGE_INTERVAL == 0) {
-                #pragma omp critical
-                mergeThreadLocalGradients();
+                
+                global_step += chunk.size();
+                samples_processed += chunk.size();
+                
+                if (samples_processed - last_progress_update >= PROGRESS_UPDATE_INTERVAL) {
+                    #pragma omp critical
+                    {
+                        float epoch_progress = static_cast<float>(samples_processed) / total_samples;
+                        float global_progress = static_cast<float>(global_step) / total_steps;
+                        int filled_width = static_cast<int>(BAR_WIDTH * epoch_progress);
+                        
+                        std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | "
+                                  << "[" << std::string(filled_width, '#') 
+                                  << std::string(BAR_WIDTH - filled_width, ' ') << "] "
+                                  << std::fixed << std::setprecision(2) << (epoch_progress * 100) << "%"
+                                  << " | LR: " << std::scientific << std::setprecision(2) << current_lr
+                                  << std::flush;
+                        
+                        last_progress_update = samples_processed;
+                    }
+                }
+                
+                if (samples_processed % MERGE_INTERVAL == 0) {
+                    #pragma omp critical
+                    mergeThreadLocalGradients();
+                }
+                
+                chunk.clear();
             }
         }
         
-        // Final merge at end of epoch
+        // Process remaining samples
+        if (!chunk.empty()) {
+            float progress = static_cast<float>(global_step) / total_steps;
+            float current_lr = lr_ * (1.0f - progress);
+            current_lr = std::max(current_lr, LR_FLOOR);
+            
+            #pragma omp parallel for schedule(dynamic) reduction(+:word_count)
+            for (int s = 0; s < static_cast<int>(chunk.size()); ++s) {
+                const auto& current_sample = chunk[s];
+                if (current_sample.words.empty()) continue;
+                
+                std::vector<float> context_vec = computeContextVector(current_sample.context_fields);
+                
+                for (size_t i = 0; i < current_sample.words.size(); ++i) {
+                    std::string word = current_sample.words[i];
+                    if (!word2idx_.count(word)) continue;
+                    
+                    int target_idx = word2idx_[word];
+                    std::vector<float> word_vec = computeWordVector(word);
+                    std::vector<float> combined = combineVectorsAdditive(word_vec, context_vec);
+                    
+                    hierarchicalSoftmax(combined, target_idx, current_lr);
+                    word_count++;
+                }
+            }
+            
+            global_step += chunk.size();
+            samples_processed += chunk.size();
+            chunk.clear();
+        }
+        
         #pragma omp critical
         mergeThreadLocalGradients();
         
-        // Clear the progress line and show completion
+        float final_progress = static_cast<float>(global_step) / total_steps;
+        float final_lr = lr_ * (1.0f - final_progress);
+        final_lr = std::max(final_lr, LR_FLOOR);
+        
         std::cout << "\rEpoch " << (epoch + 1) << "/" << epoch_ << " | " 
                   << "[" << std::string(BAR_WIDTH, '#') << "] 100.00%"
+                  << " | LR: " << std::scientific << std::setprecision(2) << final_lr
                   << " | Done!" << std::endl;
     }
     
-    std::cout << "\nTraining complete!" << std::endl;
-}
-
-void FastTextContext::train(const std::string& filename) {
-    auto samples = parseFile(filename);
-    std::cout << "Parsed " << samples.size() << " training samples" << std::endl;
-    
-    buildVocab(samples);
-    buildHuffmanTree();
-    initializeMatrices();
-    trainModel(samples);
-
+    file.close();
 }
 
 void FastTextContext::saveModel(const std::string& filename) const {
