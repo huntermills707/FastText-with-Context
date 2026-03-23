@@ -10,15 +10,15 @@ void printUsage(const char* prog) {
               << "  model.bin    Path to the saved model file (required)\n"
               << "  word1, word2...  One or more words to combine (required)\n"
               << "  --ctx        Flag indicating context fields follow (optional)\n"
-              << "  ctx1, ctx2...    Context fields (e.g., author:alice, domain:tech)\n"
+              << "  ctx1, ctx2...    Context fields (e.g., alice, tech)\n"
               << "  --k          Flag indicating number of neighbors (optional, default: 10)\n"
               << "  number       Number of neighbors to return (default: 10)\n"
               << std::endl;
     std::cerr << "Examples:\n"
               << "  " << prog << " model.bin machine 10\n"
               << "  " << prog << " model.bin machine --k 20\n"
-              << "  " << prog << " model.bin machine learning --ctx author:alice domain:tech --k 10\n"
-              << "  " << prog << " model.bin machine --ctx author:alice --k 15\n"
+              << "  " << prog << " model.bin machine learning --ctx alice tech --k 10\n"
+              << "  " << prog << " model.bin machine --ctx alice --k 15\n"
               << std::endl;
 }
 

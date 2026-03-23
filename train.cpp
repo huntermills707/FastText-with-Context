@@ -2,7 +2,6 @@
 #include <iostream>
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <omp.h>
 
 void printUsage(const char* prog) {
@@ -15,8 +14,8 @@ void printUsage(const char* prog) {
               << "  -maxn <int>           Maximum n-gram length (default: 6)\n"
               << "  -threshold <int>      Word frequency threshold (default: 5)\n"
               << "  -threads <int>        Number of OpenMP threads (default: system max)\n"
-              << "  -merge-interval <int> Samples between gradient merges (default: 100000)\n"
-              << "  -chunk-size <int>     Samples per chunk for streaming (default: 10000)\n"
+              << "  -chunk-size <int>     Samples per chunk (default: 10000)\n"
+              << "  -ngram-buckets <int>  N-gram hash buckets (default: 2000000)\n"
               << "  -help                 Show this help message\n"
               << std::endl;
 }
@@ -29,8 +28,8 @@ int main(int argc, char* argv[]) {
     int max_n = 6;
     int threshold = 5;
     int threads = omp_get_max_threads();
-    int merge_interval = 100000;
     int chunk_size = 10000;
+    int ngram_buckets = 2000000; 
 
     std::string inputFile;
     std::string outputFile;
@@ -63,11 +62,11 @@ int main(int argc, char* argv[]) {
         else if (arg == "-threads" && i + 1 < argc) {
             threads = std::stoi(argv[++i]);
         }
-        else if (arg == "-merge-interval" && i + 1 < argc) {
-            merge_interval = std::stoi(argv[++i]);
-        }
         else if (arg == "-chunk-size" && i + 1 < argc) {
             chunk_size = std::stoi(argv[++i]);
+        }
+        else if (arg == "-ngram-buckets" && i + 1 < argc) {
+            ngram_buckets = std::stoi(argv[++i]);
         }
         else if (arg[0] != '-') {
             if (inputFile.empty()) {
@@ -101,13 +100,14 @@ int main(int argc, char* argv[]) {
     std::cout << "  N-grams:         " << min_n << "-" << max_n << std::endl;
     std::cout << "  Threshold:       " << threshold << std::endl;
     std::cout << "  Threads:         " << threads << std::endl;
-    std::cout << "  Merge Interval:  " << merge_interval << " samples" << std::endl;
     std::cout << "  Chunk Size:      " << chunk_size << " samples" << std::endl;
+    std::cout << "  N-gram Buckets:  " << ngram_buckets << std::endl;
     std::cout << "  Mode:            Streaming (two-pass)" << std::endl;
     std::cout << std::endl;
 
     try {
-        fasttext::FastTextContext ft(dim, epoch, lr, min_n, max_n, threshold, merge_interval, chunk_size);
+        fasttext::FastTextContext ft(dim, epoch, lr, min_n, max_n, threshold,
+                                     chunk_size, ngram_buckets);
         
         auto start = std::chrono::high_resolution_clock::now();
         
