@@ -12,6 +12,7 @@
 #include <queue>
 #include <omp.h>
 #include <cstdint>
+#include <limits>
 
 namespace fasttext {
 
@@ -47,6 +48,8 @@ public:
     std::vector<float> getContextVector(const std::string& context_field);
     std::vector<float> getCombinedVector(const std::vector<std::string>& words, 
                                          const std::vector<std::string>& contexts);
+    
+    // Optimized nearest neighbors using direct index access and vectorized-like loops
     std::vector<std::pair<std::string, float>> getNearestNeighbors(
         const std::vector<std::string>& words, 
         const std::vector<std::string>& contexts, 
@@ -107,7 +110,7 @@ private:
                                               const std::vector<float>& context_vec);
     void hierarchicalSoftmax(const std::vector<float>& combined_input,
                             int target_word_idx,
-                            float grad_scale);  // grad_scale now carries the current LR
+                            float grad_scale);
     void cleanupHuffmanTree(HuffmanNode* node);
     void mergeThreadLocalGradients();
     bool parseNextSample(std::ifstream& file, StreamingSample& sample);
