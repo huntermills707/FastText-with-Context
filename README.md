@@ -1,202 +1,207 @@
 # FastTextContext
 
-A custom implementation of FastText with context-aware embeddings, built from scratch in C++ with OpenMP parallelization.
+A high-performance, custom C++ implementation of FastText extended with additive context embeddings. Built from scratch with OpenMP parallelization, this library supports streaming training on large datasets and allows word vectors to be dynamically adjusted by metadata (e.g., author, domain, timestamp).
 
-## Overview
+## Key Features
 
-FastTextContext extends the original FastText algorithm by incorporating metadata/context embeddings alongside traditional word and subword (n-gram) representations. This allows the model to capture not just semantic meaning, but also contextual signals like author, domain, or other metadata that influence word usage.
+* Additive Context Modeling: Unlike standard FastText, this implementation learns separate embeddings for context fields (metadata) and adds them element-wise to word vectors during training and inference.
+    * Formula: combined_vector = word_vector + context_vector
+* Streaming Training: Two-pass architecture (vocabulary counting -> training) designed to handle datasets larger than RAM.
+* Hierarchical Softmax: Optimized training using Huffman trees for logarithmic complexity relative to vocabulary size.
+* Subword Awareness: Character n-grams (configurable range) handle out-of-vocabulary words and morphological variations.
+* Multi-threaded: Full OpenMP integration for parallel matrix initialization, gradient accumulation, and nearest-neighbor search.
+* Three Binaries:
+    * train: Streamlined training pipeline.
+    * query: Interactive nearest-neighbor search with context support.
+    * compare: Cosine/Euclidean similarity analysis between complex word+context combinations.
+* Python Compatibility: Includes a pure Python loader (fasttext_context.py) for easy integration into data science workflows.
 
-Key features:
-- **Additive context combination**: Context vectors are added to word vectors in the same embedding space
-- **Hierarchical softmax**: Efficient training with logarithmic complexity
-- **Subword information**: Character n-grams (3-6 chars) for handling out-of-vocabulary words
-- **OpenMP parallelization**: Multi-threaded training and inference
-- **Model persistence**: Binary save/load for fast deployment
+## Prerequisites
+
+* Compiler: GCC 7+ or Clang 5+ (C++17 support required)
+* Libraries: OpenMP (libomp or libgomp)
+* Python (Optional, for the loader script): numpy, struct
 
 ## Building
 
-### Prerequisites
-- C++17 compatible compiler (GCC 7+, Clang 5+)
-- OpenMP support
-- CMake (optional, for build automation)
-
-### Compilation
+The project uses a simple Makefile.
 
 ```bash
-# Clone or download the source
-git clone <repository-url>
+# Clone or copy source files
 cd FastTextContext
 
-# Build both binaries
+# Build all binaries (train, query, compare)
 make all
 
-# Or build individually
-make train    # Training binary
-make query    # Inference binary
+# Build individually
+make train
+make query
+make compare
+
+# Clean build artifacts
+make clean
 ```
 
 ### Compiler Flags
+The default build uses aggressive optimization:
 ```makefile
 CXX = g++
 CXXFLAGS = -O3 -std=c++17 -march=native -fopenmp
-LDFLAGS = -fopenmp
 ```
 
 ## Usage
 
-### Training
+### 1. Training
 
-```bash
-# Basic usage
-./train training_data.txt model.bin
+The training process reads a pipe-delimited text file where the last field is the sentence and preceding fields are context metadata.
 
-# With custom parameters
-./train -dim 200 -epoch 10 -lr 0.05 -threads 8 training_data.txt model.bin
-
-# Full parameter list
-./train -help
-```
-
-#### Training Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `-dim` | 100 | Embedding dimension (word & context) |
-| `-epoch` | 5 | Number of training epochs |
-| `-lr` | 0.05 | Learning rate |
-| `-minn` | 3 | Minimum n-gram length |
-| `-maxn` | 6 | Maximum n-gram length |
-| `-threshold` | 5 | Word frequency threshold |
-| `-threads` | System max | OpenMP thread count |
-
-### Querying
-
-```bash
-# Single word, single context
-./query model.bin machine --ctx alice --k 10
-
-# Multiple words, multiple contexts
-./query model.bin machine learning --ctx alice tech --k 10
-
-# Multiple words, no context
-./query model.bin machine learning 10
-
-# Help
-./query -help
-```
-
-## Data Format
-
-### Training File Format
-
-Each line represents one training sample with pipe-delimited fields:
-
-```
-context1|context2|...|contextN|sentence
-```
-
-**Example:**
-```
+**Data Format Example (data.txt):**
+```text
 alice|tech|Machine learning is advancing rapidly
-bob|2024|Bitcoin prices fluctuate wildly
+bob|finance|Bitcoin prices fluctuate wildly
 alice|tech|2024|Deep learning models improve accuracy
 ```
 
-- **Context fields**: All fields except the last one are treated as context metadata
-- **Sentence**: The last field is tokenized into words for training
-- **Delimiter**: Pipe character (`|`) separates fields
-
-### Model File Format
-
-Binary format containing:
-- Header (dimensions, thresholds, vocabulary sizes)
-- Word vocabulary map
-- Context vocabulary map
-- Input matrix (word embeddings)
-- Output matrix (hierarchical softmax nodes)
-- N-gram matrix (subword embeddings)
-- Context matrix
-- Huffman tree codes/paths
-
-**File size estimate:**
-- N-gram matrix: ~800 MB (2M buckets × 100 dims × 4 bytes)
-- Word matrix: ~20 MB (50K words × 100 dims × 4 bytes)
-- Context matrix: ~0.4 MB (1K contexts × 100 dims × 4 bytes)
-
-## Architecture
-
-### Vector Combination
-
-```
-combined_vector = word_vector + context_vector
+**Basic Command:**
+```bash
+./train data.txt model.bin
 ```
 
-Both word and context vectors exist in the same embedding space (`dim` dimensions). Context vectors are averaged across multiple context fields, then added element-wise to the word vector.
+**Advanced Options:**
+```bash
+./train -dim 200 -epoch 10 -lr 0.05 -minn 3 -maxn 6 -threshold 5 -threads 8 -chunk-size 10000 -ngram-buckets 2000000 data.txt model.bin
+```
 
-### Training Algorithm
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-dim` | `100` | Embedding dimension |
+| `-epoch` | `5` | Number of training epochs |
+| `-lr` | `0.05` | Initial learning rate (linear decay) |
+| `-minn` | `3` | Minimum n-gram length |
+| `-maxn` | `6` | Maximum n-gram length |
+| `-threshold` | `5` | Minimum word frequency to include |
+| `-threads` | `System` | OpenMP thread count |
+| `-chunk-size` | `10000` | Samples processed before gradient merge |
+| `-ngram-buckets` | `2000000` | Hash buckets for subword hashing |
 
-1. **Parse training data** → Extract words and context fields
-2. **Build vocabulary** → Filter words by frequency threshold
-3. **Build Huffman tree** → For hierarchical softmax
-4. **Initialize matrices** → Random initialization with small values
-5. **Train with hierarchical softmax** → Update weights along Huffman tree paths
-6. **Thread-local gradients** → Accumulate locally, merge once per epoch
+### 2. Querying (Nearest Neighbors)
 
-### Parallelization Strategy
+Find words semantically similar to a query, optionally conditioned on context.
 
-| Component | Method | Expected Speedup |
-|-----------|--------|------------------|
-| Training loop | Thread-local gradients | 4-8× (8 cores) |
-| Nearest neighbor search | Parallel iteration | 6-10× (8 cores) |
-| Word vector computation | N-gram reduction | 1.5-2× |
-| Matrix initialization | Parallel for | 2-4× |
+**Syntax:**
+```bash
+./query <model.bin> <word1> [word2...] [--ctx <ctx1> [ctx2...]] [--k <num>]
+```
+
+**Examples:**
+```bash
+# Find neighbors of "machine" with no context
+./query model.bin machine --k 10
+
+# Find neighbors of "bitcoin" conditioned on "finance" and "bob"
+./query model.bin bitcoin --ctx finance bob --k 10
+
+# Combine multiple words and contexts
+./query model.bin machine learning --ctx alice tech --k 20
+```
+
+### 3. Comparing Vectors
+
+Calculate similarity metrics between two complex queries (words + contexts).
+
+**Syntax:**
+```bash
+./compare <model.bin> --words1 <w1> [w2...] [--ctx1 <c1>...] --words2 <w1> [w2...] [--ctx2 <c1>...]
+```
+
+**Example:**
+```bash
+# Compare "market" in finance vs "market" in tech
+./compare model.bin --words1 market --ctx1 finance --words2 market --ctx2 tech
+```
+
+**Output includes:**
+* Cosine Similarity
+* Cosine Distance
+* Euclidean Distance
+* Semantic interpretation hints
+
+## Python Integration
+
+A Python loader is provided to load the binary model and perform inference without compiling C++.
+
+**Installation:**
+```bash
+pip install numpy
+```
+
+**Usage:**
+```python
+from fasttext_context import FastTextContext
+
+ft = FastTextContext()
+ft.load_model("model.bin")
+
+# Get word vector (includes n-grams)
+vec = ft.get_word_vector("machine")
+
+# Get combined vector (words + contexts)
+combined = ft.get_combined_vector(["bitcoin"], ["finance"])
+
+# Find neighbors
+neighbors = ft.get_nearest_neighbors(["bitcoin"], ["finance"], k=5)
+for word, score in neighbors:
+    print(f"{word}: {score:.4f}")
+
+# Compare two concepts
+similarity = ft.compare_vectors(["market"], ["finance"], ["market"], ["tech"])
+print(f"Cosine Similarity: {similarity['cosine_similarity']}")
+```
+
+## Architecture Overview
+
+### Data Flow
+1. Pass 1 (Vocabulary): Scans input file to count word and context frequencies. Filters by threshold.
+2. Huffman Tree: Constructs a binary tree based on word frequencies for Hierarchical Softmax.
+3. Initialization: Matrices (Input, Output, Context, N-gram) are initialized with small random values using thread-local RNGs.
+4. Pass 2 (Training):
+    * Parses lines into StreamingSample objects.
+    * Computes combined_vector = word_vec + avg(context_vec).
+    * Performs forward/backward pass along the Huffman path.
+    * Accumulates gradients in thread-local buffers.
+    * Merges gradients periodically (chunk-based) to update the Output matrix.
+
+### Memory Layout
+* Input Matrix: (Vocab_Size, Dim) - Word embeddings.
+* Context Matrix: (Context_Size, Dim) - Metadata embeddings.
+* N-gram Matrix: (Hash_Buckets, Dim) - Subword embeddings.
+* Output Matrix: (Huffman_Nodes, Dim) - Hierarchical softmax weights.
 
 ## Performance Tuning
 
-### Memory Optimization
-
-To reduce model size:
-```bash
-# Reduce n-gram buckets (biggest impact)
-# Edit fasttext_context.cpp: int ngram_buckets = 1000000;  # Instead of 2000000
-
-# Reduce dimension
-./train -dim 50 data.txt model.bin
-
-# Increase threshold (fewer words in vocabulary)
-./train -threshold 10 data.txt model.bin
-```
-
-### Thread Configuration
-
-```bash
-# Set OpenMP threads
-export OMP_NUM_THREADS=8
-./train data.txt model.bin
-
-# Or use CLI flag
-./train -threads 8 data.txt model.bin
-```
-
-## Limitations
-
-- **No quantization**: Model saved as float32 (consider int16 for 50% size reduction)
-- **Single-file training**: Does not support streaming or incremental updates
-- **No supervised mode**: Only unsupervised word embedding training
-- **Context dimension**: Must match word dimension (additive combination requirement)
+* Memory Reduction: Decrease -ngram-buckets (e.g., to 1000000) or -dim for smaller models.
+* Speed: Increase -chunk-size to reduce synchronization overhead, or tune -threads to match your CPU core count.
+* Quality: Increase -epoch and lower -threshold for better coverage of rare words, at the cost of training time.
 
 ## File Structure
 
 ```
-FastTextContext/
-├── fasttext_context.h     # Class definition
-├── fasttext_context.cpp   # Implementation
-├── train.cpp              # Training binary
-├── query.cpp              # Inference binary
-├── Makefile               # Build configuration
-└── README.md              # This file
+.
+├── fasttext_context.h      # Core class definition
+├── fasttext_context.cpp    # Training & Inference logic
+├── types.h                 # Shared structs (HuffmanNode, Sample)
+├── matrix.h                # Matrix class (inline)
+├── vocabulary.h/cpp        # Vocab building & Huffman tree
+├── trainer.h/cpp           # Training loop & gradient logic
+├── inference.h/cpp         # Vector computation & NN search
+├── train.cpp               # CLI for training
+├── query.cpp               # CLI for nearest neighbors
+├── compare.cpp             # CLI for vector comparison
+├── fasttext_context.py     # Python loader
+├── Makefile                # Build configuration
+└── README.md               # Documentation
 ```
 
 ## License
 
-MIT License - See LICENSE file for details.
+MIT License. See LICENSE for details.
