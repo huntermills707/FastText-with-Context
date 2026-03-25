@@ -93,11 +93,11 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     std::cout << "  N-grams:         " << min_n_ << "-" << max_n_ << std::endl;
     std::cout << "  Threshold:       " << threshold_ << std::endl;
     std::cout << "  Chunk Size:      " << chunk_size_ << std::endl;
-    std::cout << "  N-gram Buckets:  " << chunk_size_ << std::endl;
+    std::cout << "  N-gram Buckets:  " << ngram_buckets_ << std::endl;
     std::cout << std::endl;
     
     // PASS 1: Count vocabulary
-    std::cout << "Pass 1/2: Counting vocabulary..." << std::endl;
+    std::cout << "Building vocabulary..." << std::endl;
     
     std::unordered_map<std::string, int> word_freq;
     std::unordered_map<std::string, int> context_freq;
@@ -160,7 +160,7 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     initializeMatrices();
     
     // PASS 2: Train
-    std::cout << "Pass 2/2: Training..." << std::endl;
+    std::cout << "Training..." << std::endl;
     Trainer trainer(dim_, epoch_, lr_, min_n_, max_n_, chunk_size_, ngram_buckets_);
     trainer.train(filename, vocab_, input_matrix_, output_matrix_, ngram_matrix_, context_matrix_);
     

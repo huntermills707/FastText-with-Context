@@ -65,7 +65,6 @@ std::vector<float> Inference::getWordVector(const std::string& word) const {
 
 std::vector<float> Inference::getContextVector(const std::vector<std::string>& contexts) const {
     std::vector<float> vec(dim_, 0.0f);
-    int count = 0;
     
     for (const auto& ctx : contexts) {
         int ctx_idx = vocab_.getContextIdx(ctx);
@@ -74,14 +73,9 @@ std::vector<float> Inference::getContextVector(const std::vector<std::string>& c
             for (int j = 0; j < dim_; ++j) {
                 vec[j] += row[j];
             }
-            count++;
         }
     }
-    
-    if (count > 0) {
-        for (float& v : vec) v /= count;
-    }
-    
+
     return vec;
 }
 
@@ -101,15 +95,6 @@ std::vector<float> Inference::getCombinedVector(const std::vector<std::string>& 
     std::vector<float> ctx_vec = getContextVector(contexts);
     for (int j = 0; j < dim_; ++j) {
         combined[j] += ctx_vec[j];
-    }
-    
-    // Normalize
-    float norm = 0.0f;
-    for (float v : combined) norm += v * v;
-    norm = std::sqrt(norm);
-    
-    if (norm > MIN_NORM) {
-        for (float& v : combined) v /= norm;
     }
     
     return combined;

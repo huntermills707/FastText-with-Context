@@ -14,8 +14,8 @@ void printUsage(const char* prog) {
               << "  -maxn <int>           Maximum n-gram length (default: 6)\n"
               << "  -threshold <int>      Word frequency threshold (default: 5)\n"
               << "  -threads <int>        Number of OpenMP threads (default: system max)\n"
-              << "  -chunk-size <int>     Samples per chunk (default: 10000)\n"
-              << "  -ngram-buckets <int>  N-gram hash buckets (default: 2000000)\n"
+              << "  -chunk-size <int>     Samples per chunk (default: 100000)\n"
+              << "  -ngram-buckets <int>  N-gram hash buckets (default: 1000000)\n"
               << "  -help                 Show this help message\n"
               << std::endl;
 }
@@ -28,8 +28,8 @@ int main(int argc, char* argv[]) {
     int max_n = 6;
     int threshold = 5;
     int threads = omp_get_max_threads();
-    int chunk_size = 10000;
-    int ngram_buckets = 2000000; 
+    int chunk_size = 100000;
+    int ngram_buckets = 1000000;
 
     std::string inputFile;
     std::string outputFile;
@@ -102,7 +102,6 @@ int main(int argc, char* argv[]) {
     std::cout << "  Threads:         " << threads << std::endl;
     std::cout << "  Chunk Size:      " << chunk_size << " samples" << std::endl;
     std::cout << "  N-gram Buckets:  " << ngram_buckets << std::endl;
-    std::cout << "  Mode:            Streaming (two-pass)" << std::endl;
     std::cout << std::endl;
 
     try {

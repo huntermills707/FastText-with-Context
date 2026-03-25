@@ -84,9 +84,8 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
     
     if (sample.words.empty()) return;
     
-    // Compute context vector (averaged) and track active context indices
+    // Compute context vector and track active context indices
     std::vector<float> context_vec(dim_, 0.0f);
-    int ctx_count = 0;
     std::vector<int> active_ctx_indices;
     
     for (const auto& ctx : sample.context_fields) {
@@ -97,14 +96,9 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
                 context_vec[j] += ctx_row[j];
             }
             active_ctx_indices.push_back(ctx_idx);
-            ctx_count++;
         }
     }
-    
-    if (ctx_count > 0) {
-        for (float& v : context_vec) v /= ctx_count;
-    }
-    
+     
     // Process each word in the sample
     for (const auto& word : sample.words) {
         int word_idx = vocab.getWordIdx(word);
@@ -176,8 +170,8 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
             thread_input_grads_[thread_id][word_idx * dim_ + j] += input_grad[j];
         }
         
-        // Distribute gradient to active contexts (scaled by 1/ctx_count)
-        float grad_scale = 1.0f / ctx_count;
+        // Distribute gradient to active contexts
+        float grad_scale = 1.0f;
         for (int ctx_idx : active_ctx_indices) {
             int global_ctx_idx = vocab.wordSize() + ctx_idx;
             for (int j = 0; j < dim_; ++j) {
