@@ -14,12 +14,12 @@ namespace fasttext {
 class Trainer {
 public:
     Trainer(int dim, int epoch, float lr, int min_n, int max_n, 
-            int chunk_size, int ngram_buckets);
+            int chunk_size, int ngram_buckets, int window_size = 20);
     
     // Main training entry point
     void train(const std::string& filename, Vocabulary& vocab,
                Matrix& input_matrix, Matrix& output_matrix,
-               Matrix& ngram_matrix, Matrix& context_matrix);
+               Matrix& ngram_matrix, Matrix& metadata_matrix);
     
 private:
     int dim_;
@@ -29,10 +29,11 @@ private:
     int max_n_;
     int chunk_size_;
     int ngram_buckets_;
+    int window_size_;
     
     // Thread-local storage for gradients
-    std::vector<Matrix> thread_grads_;  // Gradients for output_matrix
-    std::vector<std::vector<float>> thread_input_grads_; // Gradients for input/ngram/context
+    std::vector<Matrix> thread_grads_;  // Gradients for output_matrix (Huffman nodes)
+    std::vector<std::vector<float>> thread_input_grads_; // Gradients for input/ngram/metadata
     
     // Thread-local RNGs
     std::vector<std::mt19937> rngs_;
@@ -43,10 +44,11 @@ private:
     // N-gram utilities
     std::vector<int> getNgramIndices(const std::string& word) const;
     
-    // Forward/backward pass
+    // Skip-gram forward/backward pass
+    // Processes a center word and its surrounding context window
     void processSample(const StreamingSample& sample, const Vocabulary& vocab,
                        Matrix& input_matrix, Matrix& output_matrix,
-                       Matrix& ngram_matrix, Matrix& context_matrix,
+                       Matrix& ngram_matrix, Matrix& metadata_matrix,
                        float current_lr, int thread_id);
     
     // Gradient merging

@@ -9,8 +9,8 @@ class FastTextContext:
     
     Supports:
     - Word vectors (with subword n-gram contributions)
-    - Context vectors
-    - Combined vectors (word + context)
+    - Metadata vectors (author, domain, etc.)
+    - Combined vectors (word + metadata)
     - Nearest neighbor search
     """
     
@@ -19,16 +19,17 @@ class FastTextContext:
         self.min_n: int = 0
         self.max_n: int = 0
         self.threshold: int = 0
+        self.window_size: int = 0
         
         self.word2idx: Dict[str, int] = {}
         self.idx2word: Dict[int, str] = {}
-        self.context2idx: Dict[str, int] = {}
-        self.idx2context: Dict[int, str] = {}
+        self.metadata2idx: Dict[str, int] = {}
+        self.idx2metadata: Dict[int, str] = {}
         
         self.input_matrix: Optional[np.ndarray] = None      # (vocab_size, dim)
         self.output_matrix: Optional[np.ndarray] = None     # (output_size, dim)
         self.ngram_matrix: Optional[np.ndarray] = None      # (ngram_buckets, dim)
-        self.context_matrix: Optional[np.ndarray] = None    # (ctx_size, dim)
+        self.metadata_matrix: Optional[np.ndarray] = None   # (meta_size, dim)
         
         self.word_codes: List[List[int]] = []
         self.word_paths: List[List[int]] = []
@@ -36,14 +37,15 @@ class FastTextContext:
     def load_model(self, filename: str) -> None:
         """Load a binary model file saved by the C++ train binary."""
         with open(filename, 'rb') as f:
-            # Read header (8 ints)
+            # Read header (9 ints now, including window_size)
             self.dim = struct.unpack('i', f.read(4))[0]
             self.min_n = struct.unpack('i', f.read(4))[0]
             self.max_n = struct.unpack('i', f.read(4))[0]
             self.threshold = struct.unpack('i', f.read(4))[0]
+            self.window_size = struct.unpack('i', f.read(4))[0]
             
             vocab_size = struct.unpack('i', f.read(4))[0]
-            ctx_size = struct.unpack('i', f.read(4))[0]
+            meta_size = struct.unpack('i', f.read(4))[0]
             ngram_size = struct.unpack('i', f.read(4))[0]
             output_size = struct.unpack('i', f.read(4))[0]
             
@@ -51,21 +53,21 @@ class FastTextContext:
             self.word2idx = {}
             self.idx2word = {}
             for _ in range(vocab_size):
-                word_len = struct.unpack('I', f.read(4))[0]  # uint32_t
+                word_len = struct.unpack('I', f.read(4))[0]
                 word = f.read(word_len).decode('utf-8')
                 idx = struct.unpack('i', f.read(4))[0]
                 self.word2idx[word] = idx
                 self.idx2word[idx] = word
             
-            # Read context vocabulary
-            self.context2idx = {}
-            self.idx2context = {}
-            for _ in range(ctx_size):
-                ctx_len = struct.unpack('I', f.read(4))[0]
-                ctx = f.read(ctx_len).decode('utf-8')
+            # Read metadata vocabulary
+            self.metadata2idx = {}
+            self.idx2metadata = {}
+            for _ in range(meta_size):
+                meta_len = struct.unpack('I', f.read(4))[0]
+                meta = f.read(meta_len).decode('utf-8')
                 idx = struct.unpack('i', f.read(4))[0]
-                self.context2idx[ctx] = idx
-                self.idx2context[idx] = ctx
+                self.metadata2idx[meta] = idx
+                self.idx2metadata[idx] = meta
             
             # Read matrices (row-major, float32)
             self.input_matrix = np.frombuffer(
@@ -80,9 +82,9 @@ class FastTextContext:
                 f.read(ngram_size * self.dim * 4), dtype=np.float32
             ).reshape(ngram_size, self.dim).copy()
             
-            self.context_matrix = np.frombuffer(
-                f.read(ctx_size * self.dim * 4), dtype=np.float32
-            ).reshape(ctx_size, self.dim).copy() if ctx_size > 0 else np.zeros((0, self.dim), dtype=np.float32)
+            self.metadata_matrix = np.frombuffer(
+                f.read(meta_size * self.dim * 4), dtype=np.float32
+            ).reshape(meta_size, self.dim).copy() if meta_size > 0 else np.zeros((0, self.dim), dtype=np.float32)
             
             # Read Huffman codes and paths
             self.word_codes = []
@@ -103,7 +105,7 @@ class FastTextContext:
                     path = []
                 self.word_paths.append(path)
         
-        print(f"Model loaded: {vocab_size} words, {ctx_size} contexts, dim={self.dim}")
+        print(f"Model loaded: {vocab_size} words, {meta_size} metadata fields, dim={self.dim}, window={self.window_size}")
     
     def _hash(self, s: str) -> int:
         """FNV-1a hash for n-gram bucketing."""
@@ -152,57 +154,52 @@ class FastTextContext:
         
         return vec
     
-    def get_context_vector(self, context: str) -> np.ndarray:
+    def get_metadata_vector(self, metadata: str) -> np.ndarray:
         """
-        Get the embedding for a single context field.
+        Get the embedding for a single metadata field.
         
         Args:
-            context: The context field value (e.g., "alice", "tech")
+            metadata: The metadata field value (e.g., "alice", "tech")
             
         Returns:
             numpy array of shape (dim,), or zeros if not found
         """
-        if context in self.context2idx:
-            idx = self.context2idx[context]
-            return self.context_matrix[idx].copy()
+        if metadata in self.metadata2idx:
+            idx = self.metadata2idx[metadata]
+            return self.metadata_matrix[idx].copy()
         return np.zeros(self.dim, dtype=np.float32)
     
-    def compute_context_vector(self, contexts: List[str]) -> np.ndarray:
+    def compute_metadata_vector(self, metadata_list: List[str]) -> np.ndarray:
         """
-        Compute the average context vector from multiple context fields.
+        Compute the summed metadata vector from multiple metadata fields.
         
         Args:
-            contexts: List of context field values
+            metadata_list: List of metadata field values
             
         Returns:
-            numpy array of shape (dim,), averaged over valid contexts
+            numpy array of shape (dim,), summed over valid metadata
         """
-        if not contexts:
+        if not metadata_list:
             return np.zeros(self.dim, dtype=np.float32)
         
         vec = np.zeros(self.dim, dtype=np.float32)
-        count = 0
         
-        for ctx in contexts:
-            if ctx in self.context2idx:
-                idx = self.context2idx[ctx]
-                vec += self.context_matrix[idx]
-                count += 1
-        
-        if count > 0:
-            vec /= count
+        for meta in metadata_list:
+            if meta in self.metadata2idx:
+                idx = self.metadata2idx[meta]
+                vec += self.metadata_matrix[idx]
         
         return vec
     
-    def get_combined_vector(self, words: List[str], contexts: Optional[List[str]] = None) -> np.ndarray:
+    def get_combined_vector(self, words: List[str], metadata: Optional[List[str]] = None) -> np.ndarray:
         """
-        Compute a combined vector from words and contexts.
+        Compute a combined vector from words and metadata.
         
         The result is normalized to unit length.
         
         Args:
             words: List of words to combine
-            contexts: Optional list of context fields
+            metadata: Optional list of metadata fields
             
         Returns:
             Normalized numpy array of shape (dim,)
@@ -213,9 +210,9 @@ class FastTextContext:
         for word in words:
             combined += self.get_word_vector(word)
         
-        # Add context vector
-        if contexts:
-            combined += self.compute_context_vector(contexts)
+        # Add metadata vector
+        if metadata:
+            combined += self.compute_metadata_vector(metadata)
         
         # Normalize
         norm = np.linalg.norm(combined)
@@ -224,20 +221,20 @@ class FastTextContext:
         
         return combined
     
-    def get_nearest_neighbors(self, words: List[str], contexts: Optional[List[str]] = None, 
+    def get_nearest_neighbors(self, words: List[str], metadata: Optional[List[str]] = None, 
                                k: int = 10) -> List[Tuple[str, float]]:
         """
-        Find the k nearest neighbors to a combined word+context query.
+        Find the k nearest neighbors to a combined word+metadata query.
         
         Args:
             words: List of query words
-            contexts: Optional list of context fields
+            metadata: Optional list of metadata fields
             k: Number of neighbors to return
             
         Returns:
             List of (word, similarity_score) tuples, sorted by similarity descending
         """
-        query_vec = self.get_combined_vector(words, contexts)
+        query_vec = self.get_combined_vector(words, metadata)
         
         query_norm = np.linalg.norm(query_vec)
         if query_norm < 1e-8:
@@ -245,11 +242,8 @@ class FastTextContext:
             return []
         
         # Compute similarities with all words (using input_matrix only for speed)
-        # Note: This doesn't include n-gram contributions for candidate words
-        # For full accuracy, use get_word_vector for each candidate
-        
         word_norms = np.linalg.norm(self.input_matrix, axis=1, keepdims=True)
-        word_norms = np.maximum(word_norms, 1e-8)  # Avoid division by zero
+        word_norms = np.maximum(word_norms, 1e-8)
         
         normalized_input = self.input_matrix / word_norms
         similarities = normalized_input @ query_vec
@@ -265,16 +259,16 @@ class FastTextContext:
         
         return results
     
-    def compare_vectors(self, words1: List[str], contexts1: Optional[List[str]],
-                        words2: List[str], contexts2: Optional[List[str]]) -> dict:
+    def compare_vectors(self, words1: List[str], metadata1: Optional[List[str]],
+                        words2: List[str], metadata2: Optional[List[str]]) -> dict:
         """
-        Compare two word+context combinations.
+        Compare two word+metadata combinations.
         
         Returns:
             Dictionary with cosine_similarity, cosine_distance, euclidean_distance
         """
-        vec1 = self.get_combined_vector(words1, contexts1)
-        vec2 = self.get_combined_vector(words2, contexts2)
+        vec1 = self.get_combined_vector(words1, metadata1)
+        vec2 = self.get_combined_vector(words2, metadata2)
         
         # Vectors are already normalized from get_combined_vector
         cosine_sim = float(np.dot(vec1, vec2))

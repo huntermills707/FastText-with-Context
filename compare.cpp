@@ -7,26 +7,26 @@
 
 void printUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " <model.bin> \\\n"
-              << "       --words1 <word1> [word2 ...] [--ctx1 <ctx1> [ctx2 ...]] \\\n"
-              << "       --words2 <word1> [word2 ...] [--ctx2 <ctx1> [ctx2 ...]]\n\n"
+              << "       --words1 <word1> [word2 ...] [--meta1 <meta1> [meta2 ...]] \\\n"
+              << "       --words2 <word1> [word2 ...] [--meta2 <meta1> [meta2 ...]]\n\n"
               << "Arguments:\n"
               << "  model.bin    Path to the saved model file (required)\n"
               << "  --words1     First set of words (required)\n"
-              << "  --ctx1       Context fields for first vector (optional)\n"
+              << "  --meta1      Metadata fields for first vector (optional)\n"
               << "  --words2     Second set of words (required)\n"
-              << "  --ctx2       Context fields for second vector (optional)\n"
+              << "  --meta2      Metadata fields for second vector (optional)\n"
               << std::endl;
     std::cerr << "Examples:\n"
               << "  # Compare two single words\n"
               << "  " << prog << " model.bin --words1 machine --words2 computer\n\n"
               << "  # Compare word combinations\n"
               << "  " << prog << " model.bin --words1 machine learning --words2 neural networks\n\n"
-              << "  # Compare with contexts\n"
-              << "  " << prog << " model.bin --words1 bitcoin --ctx1 finance bob \\\n"
-              << "                         --words2 crypto --ctx2 tech alice\n\n"
-              << "  # Same words, different contexts\n"
-              << "  " << prog << " model.bin --words1 market --ctx1 finance \\\n"
-              << "                         --words2 market --ctx2 tech\n"
+              << "  # Compare with metadata\n"
+              << "  " << prog << " model.bin --words1 bitcoin --meta1 finance bob \\\n"
+              << "                         --words2 crypto --meta2 tech alice\n\n"
+              << "  # Same words, different metadata\n"
+              << "  " << prog << " model.bin --words1 market --meta1 finance \\\n"
+              << "                         --words2 market --meta2 tech\n"
               << std::endl;
 }
 
@@ -38,15 +38,15 @@ int main(int argc, char* argv[]) {
 
     std::string modelFile = argv[1];
     std::vector<std::string> words1, words2;
-    std::vector<std::string> ctx1, ctx2;
+    std::vector<std::string> meta1, meta2;
 
     // Parse arguments
     enum class ParseState {
         DEFAULT,
         WORDS1,
-        CTX1,
+        META1,
         WORDS2,
-        CTX2
+        META2
     };
     
     ParseState state = ParseState::DEFAULT;
@@ -58,16 +58,16 @@ int main(int argc, char* argv[]) {
             state = ParseState::WORDS1;
             continue;
         }
-        else if (arg == "--ctx1") {
-            state = ParseState::CTX1;
+        else if (arg == "--meta1") {
+            state = ParseState::META1;
             continue;
         }
         else if (arg == "--words2") {
             state = ParseState::WORDS2;
             continue;
         }
-        else if (arg == "--ctx2") {
-            state = ParseState::CTX2;
+        else if (arg == "--meta2") {
+            state = ParseState::META2;
             continue;
         }
         
@@ -75,14 +75,14 @@ int main(int argc, char* argv[]) {
             case ParseState::WORDS1:
                 words1.push_back(arg);
                 break;
-            case ParseState::CTX1:
-                ctx1.push_back(arg);
+            case ParseState::META1:
+                meta1.push_back(arg);
                 break;
             case ParseState::WORDS2:
                 words2.push_back(arg);
                 break;
-            case ParseState::CTX2:
-                ctx2.push_back(arg);
+            case ParseState::META2:
+                meta2.push_back(arg);
                 break;
             case ParseState::DEFAULT:
                 std::cerr << "Error: Unexpected argument '" << arg << "' (no flag specified)\n";
@@ -110,8 +110,8 @@ int main(int argc, char* argv[]) {
         ft.loadModel(modelFile);
         
         // Compute combined vectors
-        std::vector<float> vec1 = ft.getCombinedVector(words1, ctx1);
-        std::vector<float> vec2 = ft.getCombinedVector(words2, ctx2);
+        std::vector<float> vec1 = ft.getCombinedVector(words1, meta1);
+        std::vector<float> vec2 = ft.getCombinedVector(words2, meta2);
         
         // Check for zero vectors
         float norm1 = 0.0f, norm2 = 0.0f;
@@ -121,11 +121,11 @@ int main(int argc, char* argv[]) {
         norm2 = std::sqrt(norm2);
         
         if (norm1 < 1e-8f) {
-            std::cerr << "Error: Vector 1 has near-zero magnitude. Check input words/contexts.\n";
+            std::cerr << "Error: Vector 1 has near-zero magnitude. Check input words/metadata.\n";
             return 1;
         }
         if (norm2 < 1e-8f) {
-            std::cerr << "Error: Vector 2 has near-zero magnitude. Check input words/contexts.\n";
+            std::cerr << "Error: Vector 2 has near-zero magnitude. Check input words/metadata.\n";
             return 1;
         }
         
@@ -137,7 +137,7 @@ int main(int argc, char* argv[]) {
         }
         
         // Cosine similarity (should be in [-1, 1] for normalized vectors)
-        float cosine_sim = dot;  // Already normalized
+        float cosine_sim = dot;
         
         // Compute Euclidean distance
         float euclidean_dist = 0.0f;
@@ -157,11 +157,11 @@ int main(int argc, char* argv[]) {
             if (i < words1.size() - 1) std::cout << ", ";
         }
         std::cout << "]\n";
-        if (!ctx1.empty()) {
-            std::cout << "  Contexts: [";
-            for (size_t i = 0; i < ctx1.size(); ++i) {
-                std::cout << ctx1[i];
-                if (i < ctx1.size() - 1) std::cout << ", ";
+        if (!meta1.empty()) {
+            std::cout << "  Metadata: [";
+            for (size_t i = 0; i < meta1.size(); ++i) {
+                std::cout << meta1[i];
+                if (i < meta1.size() - 1) std::cout << ", ";
             }
             std::cout << "]\n";
         }
@@ -174,11 +174,11 @@ int main(int argc, char* argv[]) {
             if (i < words2.size() - 1) std::cout << ", ";
         }
         std::cout << "]\n";
-        if (!ctx2.empty()) {
-            std::cout << "  Contexts: [";
-            for (size_t i = 0; i < ctx2.size(); ++i) {
-                std::cout << ctx2[i];
-                if (i < ctx2.size() - 1) std::cout << ", ";
+        if (!meta2.empty()) {
+            std::cout << "  Metadata: [";
+            for (size_t i = 0; i < meta2.size(); ++i) {
+                std::cout << meta2[i];
+                if (i < meta2.size() - 1) std::cout << ", ";
             }
             std::cout << "]\n";
         }

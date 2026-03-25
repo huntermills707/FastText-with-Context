@@ -8,10 +8,10 @@
 namespace fasttext {
 
 Inference::Inference(const Vocabulary& vocab, const Matrix& input_matrix,
-                     const Matrix& ngram_matrix, const Matrix& context_matrix,
+                     const Matrix& ngram_matrix, const Matrix& metadata_matrix,
                      int min_n, int max_n)
     : vocab_(vocab), input_matrix_(input_matrix), ngram_matrix_(ngram_matrix),
-      context_matrix_(context_matrix), min_n_(min_n), max_n_(max_n),
+      metadata_matrix_(metadata_matrix), min_n_(min_n), max_n_(max_n),
       dim_(input_matrix.cols()) {}
 
 uint64_t Inference::hash(const std::string& str) const {
@@ -63,13 +63,13 @@ std::vector<float> Inference::getWordVector(const std::string& word) const {
     return vec;
 }
 
-std::vector<float> Inference::getContextVector(const std::vector<std::string>& contexts) const {
+std::vector<float> Inference::getMetadataVector(const std::vector<std::string>& metadata) const {
     std::vector<float> vec(dim_, 0.0f);
     
-    for (const auto& ctx : contexts) {
-        int ctx_idx = vocab_.getContextIdx(ctx);
-        if (ctx_idx >= 0) {
-            const float* row = context_matrix_.row(ctx_idx);
+    for (const auto& meta : metadata) {
+        int meta_idx = vocab_.getMetadataIdx(meta);
+        if (meta_idx >= 0) {
+            const float* row = metadata_matrix_.row(meta_idx);
             for (int j = 0; j < dim_; ++j) {
                 vec[j] += row[j];
             }
@@ -80,7 +80,7 @@ std::vector<float> Inference::getContextVector(const std::vector<std::string>& c
 }
 
 std::vector<float> Inference::getCombinedVector(const std::vector<std::string>& words,
-                                                const std::vector<std::string>& contexts) const {
+                                                const std::vector<std::string>& metadata) const {
     std::vector<float> combined(dim_, 0.0f);
     
     // Sum word vectors
@@ -91,10 +91,21 @@ std::vector<float> Inference::getCombinedVector(const std::vector<std::string>& 
         }
     }
     
-    // Add context vector
-    std::vector<float> ctx_vec = getContextVector(contexts);
+    // Add metadata vector
+    std::vector<float> meta_vec = getMetadataVector(metadata);
     for (int j = 0; j < dim_; ++j) {
-        combined[j] += ctx_vec[j];
+        combined[j] += meta_vec[j];
+    }
+    
+    // Normalize
+    float norm = 0.0f;
+    for (float v : combined) norm += v * v;
+    norm = std::sqrt(norm);
+    
+    if (norm > MIN_NORM) {
+        for (int j = 0; j < dim_; ++j) {
+            combined[j] /= norm;
+        }
     }
     
     return combined;
@@ -102,10 +113,10 @@ std::vector<float> Inference::getCombinedVector(const std::vector<std::string>& 
 
 std::vector<std::pair<std::string, float>> Inference::getNearestNeighbors(
     const std::vector<std::string>& words,
-    const std::vector<std::string>& contexts,
+    const std::vector<std::string>& metadata,
     int k) const {
     
-    std::vector<float> query_vec = getCombinedVector(words, contexts);
+    std::vector<float> query_vec = getCombinedVector(words, metadata);
     
     float query_norm = 0.0f;
     for (float v : query_vec) query_norm += v * v;
@@ -120,7 +131,6 @@ std::vector<std::pair<std::string, float>> Inference::getNearestNeighbors(
     int num_threads = omp_get_max_threads();
     
     // Thread-local storage for top-k candidates
-    // Using a min-heap of size k for each thread
     using PQueue = std::priority_queue<std::pair<float, int>,
                                        std::vector<std::pair<float, int>>,
                                        std::greater<>>;

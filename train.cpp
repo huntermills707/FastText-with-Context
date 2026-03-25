@@ -16,6 +16,7 @@ void printUsage(const char* prog) {
               << "  -threads <int>        Number of OpenMP threads (default: system max)\n"
               << "  -chunk-size <int>     Samples per chunk (default: 100000)\n"
               << "  -ngram-buckets <int>  N-gram hash buckets (default: 1000000)\n"
+              << "  -window-size <int>    Skip-gram window size (default: 20)\n"
               << "  -help                 Show this help message\n"
               << std::endl;
 }
@@ -30,6 +31,7 @@ int main(int argc, char* argv[]) {
     int threads = omp_get_max_threads();
     int chunk_size = 100000;
     int ngram_buckets = 1000000;
+    int window_size = 20;
 
     std::string inputFile;
     std::string outputFile;
@@ -68,6 +70,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "-ngram-buckets" && i + 1 < argc) {
             ngram_buckets = std::stoi(argv[++i]);
         }
+        else if (arg == "-window-size" && i + 1 < argc) {
+            window_size = std::stoi(argv[++i]);
+        }
         else if (arg[0] != '-') {
             if (inputFile.empty()) {
                 inputFile = arg;
@@ -99,6 +104,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  LR:              " << lr << std::endl;
     std::cout << "  N-grams:         " << min_n << "-" << max_n << std::endl;
     std::cout << "  Threshold:       " << threshold << std::endl;
+    std::cout << "  Window size:     " << window_size << " (Skip-gram)" << std::endl;
     std::cout << "  Threads:         " << threads << std::endl;
     std::cout << "  Chunk Size:      " << chunk_size << " samples" << std::endl;
     std::cout << "  N-gram Buckets:  " << ngram_buckets << std::endl;
@@ -106,7 +112,7 @@ int main(int argc, char* argv[]) {
 
     try {
         fasttext::FastTextContext ft(dim, epoch, lr, min_n, max_n, threshold,
-                                     chunk_size, ngram_buckets);
+                                     chunk_size, ngram_buckets, window_size);
         
         auto start = std::chrono::high_resolution_clock::now();
         

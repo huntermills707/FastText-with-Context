@@ -9,7 +9,7 @@ namespace fasttext {
 
 // Training sample parsed from file
 struct StreamingSample {
-    std::vector<std::string> context_fields;
+    std::vector<std::string> metadata_fields;
     std::vector<std::string> words;
 };
 

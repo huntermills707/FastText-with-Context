@@ -8,11 +8,11 @@
 namespace fasttext {
 
 void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& word_freq,
-                                 const std::unordered_map<std::string, int>& context_freq) {
+                                 const std::unordered_map<std::string, int>& metadata_freq) {
     int word_idx = 0;
     int filtered_count = 0;
 
-    // Sort words by frequency for deterministic ordering (optional but good for reproducibility)
+    // Sort words by frequency for deterministic ordering
     std::vector<std::pair<std::string, int>> sorted_words(word_freq.begin(), word_freq.end());
     std::sort(sorted_words.begin(), sorted_words.end(), 
               [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -28,23 +28,23 @@ void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& wor
         }
     }
 
-    int ctx_idx = 0;
-    // Sort contexts similarly
-    std::vector<std::pair<std::string, int>> sorted_ctx(context_freq.begin(), context_freq.end());
-    std::sort(sorted_ctx.begin(), sorted_ctx.end(),
+    int meta_idx = 0;
+    // Sort metadata fields similarly
+    std::vector<std::pair<std::string, int>> sorted_meta(metadata_freq.begin(), metadata_freq.end());
+    std::sort(sorted_meta.begin(), sorted_meta.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    for (const auto& [ctx, count] : sorted_ctx) {
-        context2idx_[ctx] = ctx_idx;
-        idx2context_.push_back(ctx);
-        ctx_idx++;
+    for (const auto& [meta, count] : sorted_meta) {
+        metadata2idx_[meta] = meta_idx;
+        idx2metadata_.push_back(meta);
+        meta_idx++;
     }
 
     std::cout << "\n=== VOCABULARY BUILD SUMMARY ===" << std::endl;
     std::cout << "Total unique words in file: " << word_freq.size() << std::endl;
     std::cout << "Words meeting threshold (" << threshold_ << "): " << word_idx << std::endl;
     std::cout << "Words filtered out: " << filtered_count << std::endl;
-    std::cout << "Context fields: " << context2idx_.size() << std::endl;
+    std::cout << "Metadata fields: " << metadata2idx_.size() << std::endl;
     std::cout << "=================================\n" << std::endl;
 }
 

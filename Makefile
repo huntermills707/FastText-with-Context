@@ -6,7 +6,7 @@ TARGET_TRAIN = train
 TARGET_QUERY = query
 TARGET_COMPARE = compare
 
-# Source files (removed matrix.cpp - all inline in header)
+# Source files
 SRC_CORE = fasttext_context.cpp vocabulary.cpp trainer.cpp inference.cpp
 SRC_TRAIN = train.cpp
 SRC_QUERY = query.cpp

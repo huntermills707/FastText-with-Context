@@ -8,25 +8,28 @@
 namespace fasttext {
 
 FastTextContext::FastTextContext(int dim, int epoch, float lr, int min_n, int max_n,
-                                 int threshold, int chunk_size, int ngram_buckets)
+                                 int threshold, int chunk_size, int ngram_buckets,
+                                 int window_size)
     : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
-      threshold_(threshold), chunk_size_(chunk_size), ngram_buckets_(ngram_buckets) {}
+      threshold_(threshold), chunk_size_(chunk_size), ngram_buckets_(ngram_buckets),
+      window_size_(window_size) {}
 
 void FastTextContext::initializeMatrices() {
     int vocab_size = vocab_.wordSize();
-    int context_size = vocab_.contextSize();
+    int metadata_size = vocab_.metadataSize();
     int num_huffman_nodes = vocab_.huffmanNodes();
     
     std::cout << "\n=== MATRIX INITIALIZATION ===" << std::endl;
     std::cout << "Word embeddings: " << vocab_size << " x " << dim_ << std::endl;
     std::cout << "Output (HS) nodes: " << num_huffman_nodes << " x " << dim_ << std::endl;
-    std::cout << "Context embeddings: " << context_size << " x " << dim_ << std::endl;
+    std::cout << "Metadata embeddings: " << metadata_size << " x " << dim_ << std::endl;
     std::cout << "N-gram buckets: " << ngram_buckets_ << " x " << dim_ << std::endl;
     std::cout << "OpenMP threads: " << omp_get_max_threads() << std::endl;
+    std::cout << "Skip-gram window size: " << window_size_ << std::endl;
     
     input_matrix_.resize(vocab_size, dim_);
     output_matrix_.resize(num_huffman_nodes, dim_);
-    context_matrix_.resize(context_size, dim_);
+    metadata_matrix_.resize(metadata_size, dim_);
     ngram_matrix_.resize(ngram_buckets_, dim_);
 
     // Initialize with thread-local RNGs to avoid race conditions
@@ -61,12 +64,12 @@ void FastTextContext::initializeMatrices() {
             }
         }
         
-        // Context matrix
+        // Metadata matrix
         #pragma omp for schedule(static)
-        for (int64_t i = 0; i < context_matrix_.rows(); ++i) {
-            for (int64_t j = 0; j < context_matrix_.cols(); ++j) {
+        for (int64_t i = 0; i < metadata_matrix_.rows(); ++i) {
+            for (int64_t j = 0; j < metadata_matrix_.cols(); ++j) {
                 std::normal_distribution<float> dist(0.0, 1.0);
-                context_matrix_.at(i, j) = dist(rng) * init_scale;
+                metadata_matrix_.at(i, j) = dist(rng) * init_scale;
             }
         }
         
@@ -92,6 +95,7 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     std::cout << "  LR:              " << lr_ << std::endl;
     std::cout << "  N-grams:         " << min_n_ << "-" << max_n_ << std::endl;
     std::cout << "  Threshold:       " << threshold_ << std::endl;
+    std::cout << "  Window size:     " << window_size_ << " (Skip-gram)" << std::endl;
     std::cout << "  Chunk Size:      " << chunk_size_ << std::endl;
     std::cout << "  N-gram Buckets:  " << ngram_buckets_ << std::endl;
     std::cout << std::endl;
@@ -100,7 +104,7 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     std::cout << "Building vocabulary..." << std::endl;
     
     std::unordered_map<std::string, int> word_freq;
-    std::unordered_map<std::string, int> context_freq;
+    std::unordered_map<std::string, int> metadata_freq;
     
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -131,9 +135,9 @@ void FastTextContext::trainStreaming(const std::string& filename) {
             word_freq[word]++;
         }
         
-        // Rest are context fields
+        // Rest are metadata fields
         for (size_t i = 0; i < fields.size() - 1; ++i) {
-            context_freq[fields[i]]++;
+            metadata_freq[fields[i]]++;
         }
         
         if (line_count % 100000 == 0) {
@@ -146,7 +150,7 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     
     // Build vocabulary
     vocab_ = Vocabulary(threshold_);
-    vocab_.buildFromCounts(word_freq, context_freq);
+    vocab_.buildFromCounts(word_freq, metadata_freq);
     
     // Build Huffman tree
     vocab_.buildHuffmanTree();
@@ -159,14 +163,14 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     // Initialize matrices
     initializeMatrices();
     
-    // PASS 2: Train
+    // PASS 2+: Train
     std::cout << "Training..." << std::endl;
-    Trainer trainer(dim_, epoch_, lr_, min_n_, max_n_, chunk_size_, ngram_buckets_);
-    trainer.train(filename, vocab_, input_matrix_, output_matrix_, ngram_matrix_, context_matrix_);
+    Trainer trainer(dim_, epoch_, lr_, min_n_, max_n_, chunk_size_, ngram_buckets_, window_size_);
+    trainer.train(filename, vocab_, input_matrix_, output_matrix_, ngram_matrix_, metadata_matrix_);
     
     // Initialize inference engine
     inference_ = std::make_unique<Inference>(vocab_, input_matrix_, ngram_matrix_, 
-                                              context_matrix_, min_n_, max_n_);
+                                              metadata_matrix_, min_n_, max_n_);
     
     std::cout << "\nTraining complete!" << std::endl;
 }
@@ -182,14 +186,15 @@ void FastTextContext::saveModel(const std::string& filename) const {
     out.write(reinterpret_cast<const char*>(&min_n_), sizeof(min_n_));
     out.write(reinterpret_cast<const char*>(&max_n_), sizeof(max_n_));
     out.write(reinterpret_cast<const char*>(&threshold_), sizeof(threshold_));
+    out.write(reinterpret_cast<const char*>(&window_size_), sizeof(window_size_));
     
     int vocab_size = vocab_.wordSize();
-    int ctx_size = vocab_.contextSize();
+    int meta_size = vocab_.metadataSize();
     int ngram_size = ngram_matrix_.rows();
     int output_size = output_matrix_.rows();
     
     out.write(reinterpret_cast<const char*>(&vocab_size), sizeof(vocab_size));
-    out.write(reinterpret_cast<const char*>(&ctx_size), sizeof(ctx_size));
+    out.write(reinterpret_cast<const char*>(&meta_size), sizeof(meta_size));
     out.write(reinterpret_cast<const char*>(&ngram_size), sizeof(ngram_size));
     out.write(reinterpret_cast<const char*>(&output_size), sizeof(output_size));
     
@@ -202,12 +207,12 @@ void FastTextContext::saveModel(const std::string& filename) const {
         out.write(reinterpret_cast<const char*>(&i), sizeof(i));
     }
     
-    // Write context vocabulary (FIXED: Complete serialization)
-    for (int i = 0; i < ctx_size; ++i) {
-        const std::string& ctx = vocab_.getContext(i);
-        uint32_t len = ctx.length();
+    // Write metadata vocabulary
+    for (int i = 0; i < meta_size; ++i) {
+        const std::string& meta = vocab_.getMetadata(i);
+        uint32_t len = meta.length();
         out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        out.write(ctx.c_str(), len);
+        out.write(meta.c_str(), len);
         out.write(reinterpret_cast<const char*>(&i), sizeof(i));
     }
     
@@ -215,7 +220,7 @@ void FastTextContext::saveModel(const std::string& filename) const {
     input_matrix_.save(out);
     output_matrix_.save(out);
     ngram_matrix_.save(out);
-    context_matrix_.save(out);
+    metadata_matrix_.save(out);
     
     // Write Huffman codes and paths
     auto writeIntVec = [&](const std::vector<std::vector<int>>& vec) {
@@ -246,10 +251,11 @@ void FastTextContext::loadModel(const std::string& filename) {
     in.read(reinterpret_cast<char*>(&min_n_), sizeof(min_n_));
     in.read(reinterpret_cast<char*>(&max_n_), sizeof(max_n_));
     in.read(reinterpret_cast<char*>(&threshold_), sizeof(threshold_));
+    in.read(reinterpret_cast<char*>(&window_size_), sizeof(window_size_));
     
-    int vocab_size, ctx_size, ngram_size, output_size;
+    int vocab_size, meta_size, ngram_size, output_size;
     in.read(reinterpret_cast<char*>(&vocab_size), sizeof(vocab_size));
-    in.read(reinterpret_cast<char*>(&ctx_size), sizeof(ctx_size));
+    in.read(reinterpret_cast<char*>(&meta_size), sizeof(meta_size));
     in.read(reinterpret_cast<char*>(&ngram_size), sizeof(ngram_size));
     in.read(reinterpret_cast<char*>(&output_size), sizeof(output_size));
     
@@ -257,9 +263,9 @@ void FastTextContext::loadModel(const std::string& filename) {
     input_matrix_.resize(vocab_size, dim_);
     output_matrix_.resize(output_size, dim_);
     ngram_matrix_.resize(ngram_size, dim_);
-    context_matrix_.resize(ctx_size, dim_);
+    metadata_matrix_.resize(meta_size, dim_);
     
-    // Read word vocabulary (FIXED: Populate vocab_ properly)
+    // Read word vocabulary
     for (int i = 0; i < vocab_size; ++i) {
         uint32_t len;
         in.read(reinterpret_cast<char*>(&len), sizeof(len));
@@ -270,22 +276,22 @@ void FastTextContext::loadModel(const std::string& filename) {
         vocab_.addWord(idx, word);
     }
     
-    // Read context vocabulary (FIXED: Complete deserialization)
-    for (int i = 0; i < ctx_size; ++i) {
+    // Read metadata vocabulary
+    for (int i = 0; i < meta_size; ++i) {
         uint32_t len;
         in.read(reinterpret_cast<char*>(&len), sizeof(len));
-        std::string ctx(len, '\0');
-        in.read(&ctx[0], len);
+        std::string meta(len, '\0');
+        in.read(&meta[0], len);
         int idx;
         in.read(reinterpret_cast<char*>(&idx), sizeof(idx));
-        vocab_.addContext(idx, ctx);
+        vocab_.addMetadata(idx, meta);
     }
     
     // Read matrices
     input_matrix_.load(in);
     output_matrix_.load(in);
     ngram_matrix_.load(in);
-    context_matrix_.load(in);
+    metadata_matrix_.load(in);
     
     // Read Huffman codes and paths
     auto readIntVec = [&](std::vector<std::vector<int>>& vec, int size) {
@@ -307,7 +313,7 @@ void FastTextContext::loadModel(const std::string& filename) {
     
     // Initialize inference engine
     inference_ = std::make_unique<Inference>(vocab_, input_matrix_, ngram_matrix_,
-                                              context_matrix_, min_n_, max_n_);
+                                              metadata_matrix_, min_n_, max_n_);
     
     std::cout << "Model loaded from " << filename << std::endl;
 }
@@ -319,29 +325,29 @@ std::vector<float> FastTextContext::getWordVector(const std::string& word) {
     return inference_->getWordVector(word);
 }
 
-std::vector<float> FastTextContext::getContextVector(const std::string& context_field) {
+std::vector<float> FastTextContext::getMetadataVector(const std::string& metadata_field) {
     if (!inference_) {
         throw std::runtime_error("Model not initialized. Train or load a model first.");
     }
-    return inference_->getContextVector({context_field});
+    return inference_->getMetadataVector({metadata_field});
 }
 
 std::vector<float> FastTextContext::getCombinedVector(const std::vector<std::string>& words,
-                                                       const std::vector<std::string>& contexts) {
+                                                       const std::vector<std::string>& metadata) {
     if (!inference_) {
         throw std::runtime_error("Model not initialized. Train or load a model first.");
     }
-    return inference_->getCombinedVector(words, contexts);
+    return inference_->getCombinedVector(words, metadata);
 }
 
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     const std::vector<std::string>& words,
-    const std::vector<std::string>& contexts,
+    const std::vector<std::string>& metadata,
     int k) {
     if (!inference_) {
         throw std::runtime_error("Model not initialized. Train or load a model first.");
     }
-    return inference_->getNearestNeighbors(words, contexts, k);
+    return inference_->getNearestNeighbors(words, metadata, k);
 }
 
 } // namespace fasttext

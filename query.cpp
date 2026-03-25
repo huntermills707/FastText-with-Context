@@ -5,20 +5,23 @@
 #include <sstream>
 
 void printUsage(const char* prog) {
-    std::cerr << "Usage: " << prog << " <model.bin> <word1> [word2 ...] [--ctx <ctx1> [ctx2 ...]] [--k <number>]\n\n"
+    std::cerr << "Usage: " << prog << " <model.bin> <word1> [word2 ...] [--ctx <meta1> [meta2 ...]] [--k <number>]\n\n"
               << "Arguments:\n"
               << "  model.bin    Path to the saved model file (required)\n"
               << "  word1, word2...  One or more words to combine (required)\n"
-              << "  --ctx        Flag indicating context fields follow (optional)\n"
-              << "  ctx1, ctx2...    Context fields (e.g., alice, tech)\n"
+              << "  --ctx        Flag indicating METADATA fields follow (optional)\n"
+              << "               (e.g., author, domain, year - NOT surrounding words)\n"
+              << "  meta1, meta2...    Metadata field values (e.g., alice, tech, 2024)\n"
               << "  --k          Flag indicating number of neighbors (optional, default: 10)\n"
               << "  number       Number of neighbors to return (default: 10)\n"
               << std::endl;
     std::cerr << "Examples:\n"
-              << "  " << prog << " model.bin machine 10\n"
-              << "  " << prog << " model.bin machine --k 20\n"
-              << "  " << prog << " model.bin machine learning --ctx alice tech --k 10\n"
-              << "  " << prog << " model.bin machine --ctx alice --k 15\n"
+              << "  # Find neighbors of 'machine' with no metadata\n"
+              << "  " << prog << " model.bin machine --k 10\n"
+              << "  # Find neighbors of 'bitcoin' conditioned on metadata 'finance' and 'bob'\n"
+              << "  " << prog << " model.bin bitcoin --ctx finance bob --k 10\n"
+              << "  # Combine multiple words and metadata\n"
+              << "  " << prog << " model.bin machine learning --ctx alice tech --k 20\n"
               << std::endl;
 }
 
@@ -30,41 +33,40 @@ int main(int argc, char* argv[]) {
 
     std::string modelFile = argv[1];
     std::vector<std::string> words;
-    std::vector<std::string> contexts;
-    int k = 10;  // Default value
+    std::vector<std::string> metadata;
+    int k = 10;
 
     // Parse arguments
-    bool ctxFlag = false;
+    bool metaFlag = false;
     bool kFlag = false;
     
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         
         if (arg == "--ctx") {
-            ctxFlag = true;
+            metaFlag = true;
             kFlag = false;
             continue;
         }
         else if (arg == "--k") {
             kFlag = true;
-            ctxFlag = false;
+            metaFlag = false;
             continue;
         }
         
         if (kFlag) {
-            // Next argument after --k should be the number
             try {
                 k = std::stoi(arg);
-                kFlag = false;  // Reset flag after consuming the value
+                kFlag = false;
             } catch (...) {
                 std::cerr << "Error: Invalid value for --k: " << arg << std::endl;
                 printUsage(argv[0]);
                 return 1;
             }
         }
-        else if (ctxFlag) {
-            // Add to contexts
-            contexts.push_back(arg);
+        else if (metaFlag) {
+            // Add to metadata
+            metadata.push_back(arg);
         }
         else {
             // Add to words (default behavior)
@@ -96,11 +98,11 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "]";
         
-        if (!contexts.empty()) {
-            std::cout << " with contexts: [";
-            for (size_t i = 0; i < contexts.size(); ++i) {
-                std::cout << contexts[i];
-                if (i < contexts.size() - 1) std::cout << ", ";
+        if (!metadata.empty()) {
+            std::cout << " with metadata: [";
+            for (size_t i = 0; i < metadata.size(); ++i) {
+                std::cout << metadata[i];
+                if (i < metadata.size() - 1) std::cout << ", ";
             }
             std::cout << "]";
         }
@@ -108,7 +110,7 @@ int main(int argc, char* argv[]) {
         
         std::cout << "Finding " << k << " nearest neighbors..." << std::endl;
         
-        auto neighbors = ft.getNearestNeighbors(words, contexts, k);
+        auto neighbors = ft.getNearestNeighbors(words, metadata, k);
         
         if (neighbors.empty()) {
             std::cout << "No neighbors found. Check your input words." << std::endl;

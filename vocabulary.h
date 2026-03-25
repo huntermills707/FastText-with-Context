@@ -14,7 +14,7 @@ public:
     
     // Build vocabulary from frequency maps
     void buildFromCounts(const std::unordered_map<std::string, int>& word_freq,
-                         const std::unordered_map<std::string, int>& context_freq);
+                         const std::unordered_map<std::string, int>& metadata_freq);
     
     // Build Huffman tree for hierarchical softmax
     void buildHuffmanTree();
@@ -25,12 +25,12 @@ public:
         return (it != word2idx_.end()) ? it->second : -1;
     }
     
-    inline int getContextIdx(const std::string& ctx) const {
-        auto it = context2idx_.find(ctx);
-        return (it != context2idx_.end()) ? it->second : -1;
+    inline int getMetadataIdx(const std::string& meta) const {
+        auto it = metadata2idx_.find(meta);
+        return (it != metadata2idx_.end()) ? it->second : -1;
     }
     
-    // NEW: Reverse lookup methods
+    // Reverse lookup methods
     inline const std::string& getWord(int idx) const { 
         if (idx < 0 || idx >= static_cast<int>(idx2word_.size())) {
             static const std::string empty = "";
@@ -39,19 +39,19 @@ public:
         return idx2word_[idx]; 
     }
     
-    inline const std::string& getContext(int idx) const { 
-        if (idx < 0 || idx >= static_cast<int>(idx2context_.size())) {
+    inline const std::string& getMetadata(int idx) const { 
+        if (idx < 0 || idx >= static_cast<int>(idx2metadata_.size())) {
             static const std::string empty = "";
             return empty;
         }
-        return idx2context_[idx]; 
+        return idx2metadata_[idx]; 
     }
     
     inline int wordSize() const { return word2idx_.size(); }
-    inline int contextSize() const { return context2idx_.size(); }
+    inline int metadataSize() const { return metadata2idx_.size(); }
     inline int huffmanNodes() const { return std::max(1, wordSize() - 1); }
     
-    // NEW: Methods for model loading (populate vocabulary from serialized data)
+    // Methods for model loading
     void addWord(int idx, const std::string& word) {
         word2idx_[word] = idx;
         if (idx >= static_cast<int>(idx2word_.size())) {
@@ -60,12 +60,12 @@ public:
         idx2word_[idx] = word;
     }
     
-    void addContext(int idx, const std::string& ctx) {
-        context2idx_[ctx] = idx;
-        if (idx >= static_cast<int>(idx2context_.size())) {
-            idx2context_.resize(idx + 1);
+    void addMetadata(int idx, const std::string& meta) {
+        metadata2idx_[meta] = idx;
+        if (idx >= static_cast<int>(idx2metadata_.size())) {
+            idx2metadata_.resize(idx + 1);
         }
-        idx2context_[idx] = ctx;
+        idx2metadata_[idx] = meta;
     }
     
     // Huffman tree data (public for trainer access)
@@ -80,10 +80,10 @@ private:
     int threshold_;
     
     std::unordered_map<std::string, int> word2idx_;
-    std::unordered_map<std::string, int> context2idx_;
+    std::unordered_map<std::string, int> metadata2idx_;
     
-    std::vector<std::string> idx2word_;  // Reverse lookup
-    std::vector<std::string> idx2context_;
+    std::vector<std::string> idx2word_;
+    std::vector<std::string> idx2metadata_;
     
     HuffmanNode* huffman_root_ = nullptr;
     

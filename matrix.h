@@ -6,7 +6,7 @@
 #include <random>
 #include <stdexcept>
 #include <cstring>
-#include <iostream>  // FIXED: Required for ostream/istream
+#include <iostream>
 
 namespace fasttext {
 
