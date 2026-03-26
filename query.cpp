@@ -9,6 +9,7 @@ void printUsage(const char* prog) {
               << "Arguments:\n"
               << "  model.bin    Path to the saved model file (required)\n"
               << "  word1, word2...  One or more words to combine (required)\n"
+              << "               (Words are represented by n-grams only, no word embeddings)\n"
               << "  --ctx        Flag indicating METADATA fields follow (optional)\n"
               << "               (e.g., author, domain, year - NOT surrounding words)\n"
               << "  meta1, meta2...    Metadata field values (e.g., alice, tech, 2024)\n"
@@ -65,11 +66,9 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (metaFlag) {
-            // Add to metadata
             metadata.push_back(arg);
         }
         else {
-            // Add to words (default behavior)
             words.push_back(arg);
         }
     }

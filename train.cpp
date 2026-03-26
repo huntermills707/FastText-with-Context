@@ -1,7 +1,6 @@
 #include "fasttext_context.h"
 #include <iostream>
 #include <chrono>
-#include <cstdlib>
 #include <omp.h>
 
 void printUsage(const char* prog) {
@@ -13,123 +12,78 @@ void printUsage(const char* prog) {
               << "  -minn <int>           Minimum n-gram length (default: 3)\n"
               << "  -maxn <int>           Maximum n-gram length (default: 6)\n"
               << "  -threshold <int>      Word frequency threshold (default: 5)\n"
+              << "  -subsample <float>    Subsampling threshold t (default: 1e-4)\n"
               << "  -threads <int>        Number of OpenMP threads (default: system max)\n"
               << "  -chunk-size <int>     Samples per chunk (default: 100000)\n"
-              << "  -ngram-buckets <int>  N-gram hash buckets (default: 1000000)\n"
-              << "  -window-size <int>    Skip-gram window size (default: 20)\n"
+              << "  -ngram-buckets <int>  N-gram hash buckets (default: 2000000)\n"
+              << "  -window-size <int>    Max skip-gram window size (default: 20)\n"
               << "  -help                 Show this help message\n"
               << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-    int dim = 100;
-    int epoch = 5;
-    float lr = 0.05f;
-    int min_n = 3;
-    int max_n = 6;
-    int threshold = 5;
-    int threads = omp_get_max_threads();
-    int chunk_size = 100000;
-    int ngram_buckets = 1000000;
-    int window_size = 20;
-
-    std::string inputFile;
-    std::string outputFile;
+    int   dim = 100, epoch = 5, min_n = 3, max_n = 6;
+    int   threshold = 5, threads = omp_get_max_threads();
+    int   chunk_size = 100000, ngram_buckets = 2000000, window_size = 20;
+    float lr = 0.05f, subsample_t = 1e-4f;
+    std::string inputFile, outputFile;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        
-        if (arg == "-help" || arg == "--help") {
-            printUsage(argv[0]);
-            return 0;
-        }
-        else if (arg == "-dim" && i + 1 < argc) {
-            dim = std::stoi(argv[++i]);
-        }
-        else if (arg == "-epoch" && i + 1 < argc) {
-            epoch = std::stoi(argv[++i]);
-        }
-        else if (arg == "-lr" && i + 1 < argc) {
-            lr = std::stof(argv[++i]);
-        }
-        else if (arg == "-minn" && i + 1 < argc) {
-            min_n = std::stoi(argv[++i]);
-        }
-        else if (arg == "-maxn" && i + 1 < argc) {
-            max_n = std::stoi(argv[++i]);
-        }
-        else if (arg == "-threshold" && i + 1 < argc) {
-            threshold = std::stoi(argv[++i]);
-        }
-        else if (arg == "-threads" && i + 1 < argc) {
-            threads = std::stoi(argv[++i]);
-        }
-        else if (arg == "-chunk-size" && i + 1 < argc) {
-            chunk_size = std::stoi(argv[++i]);
-        }
-        else if (arg == "-ngram-buckets" && i + 1 < argc) {
-            ngram_buckets = std::stoi(argv[++i]);
-        }
-        else if (arg == "-window-size" && i + 1 < argc) {
-            window_size = std::stoi(argv[++i]);
-        }
+        if (arg == "-help" || arg == "--help")  { printUsage(argv[0]); return 0; }
+        else if (arg == "-dim"          && i+1 < argc) dim           = std::stoi(argv[++i]);
+        else if (arg == "-epoch"        && i+1 < argc) epoch         = std::stoi(argv[++i]);
+        else if (arg == "-lr"           && i+1 < argc) lr            = std::stof(argv[++i]);
+        else if (arg == "-minn"         && i+1 < argc) min_n         = std::stoi(argv[++i]);
+        else if (arg == "-maxn"         && i+1 < argc) max_n         = std::stoi(argv[++i]);
+        else if (arg == "-threshold"    && i+1 < argc) threshold     = std::stoi(argv[++i]);
+        else if (arg == "-subsample"    && i+1 < argc) subsample_t   = std::stof(argv[++i]);
+        else if (arg == "-threads"      && i+1 < argc) threads       = std::stoi(argv[++i]);
+        else if (arg == "-chunk-size"   && i+1 < argc) chunk_size    = std::stoi(argv[++i]);
+        else if (arg == "-ngram-buckets"&& i+1 < argc) ngram_buckets = std::stoi(argv[++i]);
+        else if (arg == "-window-size"  && i+1 < argc) window_size   = std::stoi(argv[++i]);
         else if (arg[0] != '-') {
-            if (inputFile.empty()) {
-                inputFile = arg;
-            } else if (outputFile.empty()) {
-                outputFile = arg;
-            }
-        }
-        else {
-            std::cerr << "Unknown argument: " << arg << std::endl;
-            printUsage(argv[0]);
-            return 1;
-        }
+            if      (inputFile.empty())  inputFile  = arg;
+            else if (outputFile.empty()) outputFile = arg;
+        } else { std::cerr << "Unknown argument: " << arg << "\n"; printUsage(argv[0]); return 1; }
     }
 
     if (inputFile.empty() || outputFile.empty()) {
-        std::cerr << "Error: Input and output files must be specified.\n" << std::endl;
+        std::cerr << "Error: input and output files required.\n";
         printUsage(argv[0]);
         return 1;
     }
 
     omp_set_num_threads(threads);
 
-    std::cout << "=== FastText Context Streaming Training ===" << std::endl;
-    std::cout << "Parameters:" << std::endl;
-    std::cout << "  Input:           " << inputFile << std::endl;
-    std::cout << "  Output:          " << outputFile << std::endl;
-    std::cout << "  Dimension:       " << dim << std::endl;
-    std::cout << "  Epochs:          " << epoch << std::endl;
-    std::cout << "  LR:              " << lr << std::endl;
-    std::cout << "  N-grams:         " << min_n << "-" << max_n << std::endl;
-    std::cout << "  Threshold:       " << threshold << std::endl;
-    std::cout << "  Window size:     " << window_size << " (Skip-gram)" << std::endl;
-    std::cout << "  Threads:         " << threads << std::endl;
-    std::cout << "  Chunk Size:      " << chunk_size << " samples" << std::endl;
-    std::cout << "  N-gram Buckets:  " << ngram_buckets << std::endl;
-    std::cout << std::endl;
+    std::cout << "=== FastTextContext Training ===\n"
+              << "  Input:           " << inputFile       << "\n"
+              << "  Output:          " << outputFile      << "\n"
+              << "  Dimension:       " << dim             << "\n"
+              << "  Epochs:          " << epoch           << "\n"
+              << "  LR:              " << lr              << "\n"
+              << "  N-grams:         " << min_n << "-" << max_n << "\n"
+              << "  Threshold:       " << threshold       << "\n"
+              << "  Subsample t:     " << subsample_t     << "\n"
+              << "  Window (max):    " << window_size     << "\n"
+              << "  Threads:         " << threads         << "\n"
+              << "  Chunk size:      " << chunk_size      << "\n"
+              << "  N-gram buckets:  " << ngram_buckets   << "\n"
+              << "  Input repr:      word embedding + n-grams + metadata\n"
+              << "  SGD:             Hogwild lock-free\n\n";
 
     try {
         fasttext::FastTextContext ft(dim, epoch, lr, min_n, max_n, threshold,
-                                     chunk_size, ngram_buckets, window_size);
-        
-        auto start = std::chrono::high_resolution_clock::now();
-        
+                                     chunk_size, ngram_buckets, window_size, subsample_t);
+        auto t0 = std::chrono::high_resolution_clock::now();
         ft.trainStreaming(inputFile);
-        
-        std::cout << "Saving model to " << outputFile << "..." << std::endl;
         ft.saveModel(outputFile);
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-        
-        std::cout << "\nDone! Total time: " << duration.count() << " seconds" << std::endl;
-        
+        auto t1   = std::chrono::high_resolution_clock::now();
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(t1 - t0).count();
+        std::cout << "Done. Total time: " << secs << "s\n";
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
-    
     return 0;
 }

@@ -12,6 +12,7 @@ void printUsage(const char* prog) {
               << "Arguments:\n"
               << "  model.bin    Path to the saved model file (required)\n"
               << "  --words1     First set of words (required)\n"
+              << "               (Words are represented by n-grams only, no word embeddings)\n"
               << "  --meta1      Metadata fields for first vector (optional)\n"
               << "  --words2     Second set of words (required)\n"
               << "  --meta2      Metadata fields for second vector (optional)\n"
@@ -108,7 +109,10 @@ int main(int argc, char* argv[]) {
         
         std::cout << "Loading model from " << modelFile << "..." << std::endl;
         ft.loadModel(modelFile);
-        
+
+        std::vector<float> test_vec = ft.getWordVector("bitcoin");
+        std::cout << "Debug: bitcoin vector norm = " << std::sqrt(std::inner_product(test_vec.begin(), test_vec.end(), test_vec.begin(), 0.0f)) << std::endl;
+                
         // Compute combined vectors
         std::vector<float> vec1 = ft.getCombinedVector(words1, meta1);
         std::vector<float> vec2 = ft.getCombinedVector(words2, meta2);

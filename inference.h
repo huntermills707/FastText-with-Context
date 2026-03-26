@@ -12,37 +12,36 @@ namespace fasttext {
 
 class Inference {
 public:
-    Inference(const Vocabulary& vocab, const Matrix& input_matrix,
-              const Matrix& ngram_matrix, const Matrix& metadata_matrix,
+    Inference(const Vocabulary& vocab,
+              const Matrix& input_matrix,
+              const Matrix& ngram_matrix,
+              const Matrix& metadata_matrix,
               int min_n, int max_n);
-    
-    // Get vector for a single word (includes n-gram contributions)
+
+    // Word vector = word_embedding (if in vocab) + sum(ngram_embeddings).
     std::vector<float> getWordVector(const std::string& word) const;
-    
-    // Get vector for metadata fields (summed)
+
     std::vector<float> getMetadataVector(const std::vector<std::string>& metadata) const;
-    
-    // Get combined vector (words + metadata, normalized)
+
+    // Combined vector (words + metadata), L2-normalised.
     std::vector<float> getCombinedVector(const std::vector<std::string>& words,
                                          const std::vector<std::string>& metadata) const;
-    
-    // Find k nearest neighbors (parallelized)
+
     std::vector<std::pair<std::string, float>> getNearestNeighbors(
         const std::vector<std::string>& words,
         const std::vector<std::string>& metadata,
-        int k) const;
+        int k,
+        const Matrix& cached_word_vectors) const;
 
 private:
     const Vocabulary& vocab_;
-    const Matrix& input_matrix_;
-    const Matrix& ngram_matrix_;
-    const Matrix& metadata_matrix_;
-    
-    int min_n_;
-    int max_n_;
-    int dim_;
-    
-    uint64_t hash(const std::string& str) const;
+    const Matrix&     input_matrix_;    // word-level embeddings (vocab_size x dim)
+    const Matrix&     ngram_matrix_;
+    const Matrix&     metadata_matrix_;
+
+    int min_n_, max_n_, dim_;
+
+    uint64_t         hash(const std::string& str) const;
     std::vector<int> getNgramIndices(const std::string& word) const;
 };
 
