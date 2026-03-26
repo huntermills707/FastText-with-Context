@@ -5,18 +5,31 @@
 #include <cmath>
 #include <algorithm>
 #include <iomanip>
+#include <chrono>
 #include <omp.h>
 #include <limits>
 
 namespace fasttext {
 
 Trainer::Trainer(int dim, int epoch, float lr, int min_n, int max_n,
-                 int chunk_size, int ngram_buckets, int window_size)
+                 int chunk_size, int ngram_buckets, int window_size, float grad_clip)
     : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
-      chunk_size_(chunk_size), ngram_buckets_(ngram_buckets), window_size_(window_size) {
+      chunk_size_(chunk_size), ngram_buckets_(ngram_buckets), window_size_(window_size),
+      grad_clip_(grad_clip) {
     int T = omp_get_max_threads();
     rngs_.resize(T);
     for (int i = 0; i < T; ++i) rngs_[i].seed(std::random_device{}() + i);
+}
+
+// Scales v down so ||v||_2 <= max_norm. Direction is preserved.
+// A zero vector or max_norm <= 0 passes through unchanged.
+void Trainer::clipNorm(std::vector<float>& v, float max_norm) {
+    if (max_norm <= 0.0f) return;
+    float norm_sq = 0.0f;
+    for (float x : v) norm_sq += x * x;
+    if (norm_sq <= max_norm * max_norm) return;
+    float scale = max_norm / std::sqrt(norm_sq);
+    for (float& x : v) x *= scale;
 }
 
 uint64_t Trainer::hash(const std::string& str) const {
@@ -149,9 +162,16 @@ float Trainer::hsStep(int node_idx, int direction,
     // Input gradient uses pre-update output row (word2vec ordering).
     for (int j = 0; j < dim_; ++j) center_grad[j] += g * out_row[j];
 
-    // Hogwild: direct update. Race conditions accepted (x86 float writes are effectively atomic).
+    // Build the output update vector, clip its norm, then apply (Hogwild).
+    // Rare words have large center_vec (many n-grams summed) and sit deep in
+    // the Huffman tree, making the raw update g * center_vec the primary source
+    // of loss spikes. Norm clipping preserves the update direction.
+    std::vector<float> out_update(dim_);
+    for (int j = 0; j < dim_; ++j) out_update[j] = g * center_vec[j];
+    clipNorm(out_update, grad_clip_);
+
     float* mut_row = output_matrix.row(node_idx);
-    for (int j = 0; j < dim_; ++j) mut_row[j] += g * center_vec[j];
+    for (int j = 0; j < dim_; ++j) mut_row[j] += out_update[j];
 
     const float p = std::max(1e-7f, std::min(1.0f - 1e-7f, sig));
     return -(target * std::log(p) + (1.0f - target) * std::log(1.0f - p));
@@ -224,6 +244,14 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
             }
         }
 
+        // Clip the accumulated input gradient before distributing.
+        // center_grad sums contributions from every (context, Huffman node) pair
+        // in the window. For a rare center word at depth D with window W, this
+        // accumulates up to W * D terms. Norm clipping here prevents that
+        // accumulation from producing a disproportionately large update to the
+        // word embedding, n-gram rows, and metadata rows.
+        clipNorm(center_grad, grad_clip_);
+
         distributeGrad(center_grad, cw_idx, ngram_idx, active_meta,
                        input_matrix, ngram_matrix, metadata_matrix);
     }
@@ -250,10 +278,12 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
     std::ifstream file(filename);
     if (!file.is_open()) throw std::runtime_error("Cannot open: " + filename);
 
+    const auto epoch_start = std::chrono::steady_clock::now();
+
     double epoch_loss  = 0.0;
     int    epoch_preds = 0, processed = 0, last_reported = 0;
-    const float  LR_FLOOR  = lr_ * 0.0001f;
-    const int    BAR_WIDTH  = 40;
+    const float LR_FLOOR = lr_ * 0.0001f;
+    const int   BAR_WIDTH = 40;
 
     std::vector<StreamingSample> chunk;
     chunk.reserve(chunk_size_);
@@ -275,10 +305,10 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
         flushChunk();
 
         if (processed - last_reported >= 1000) {
-            float prog  = static_cast<float>(processed) / total_samples;
-            int   filled = static_cast<int>(BAR_WIDTH * prog);
-            double avg  = epoch_preds > 0 ? epoch_loss / epoch_preds : 0.0;
-            float lr    = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
+            float  prog   = static_cast<float>(processed) / total_samples;
+            int    filled = static_cast<int>(BAR_WIDTH * prog);
+            double avg    = epoch_preds > 0 ? epoch_loss / epoch_preds : 0.0;
+            float  lr     = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
             std::cout << "\rEpoch " << (ep + 1) << "/" << epoch_ << " | ["
                       << std::string(filled, '#') << std::string(BAR_WIDTH - filled, ' ') << "] "
                       << std::fixed << std::setprecision(2) << (prog * 100) << "%"
@@ -290,11 +320,21 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
 
     if (!chunk.empty()) flushChunk();
 
-    double avg = epoch_preds > 0 ? epoch_loss / epoch_preds : 0.0;
+    const auto epoch_end = std::chrono::steady_clock::now();
+    const double elapsed  = std::chrono::duration<double>(epoch_end - epoch_start).count();
+    const double avg_loss = epoch_preds > 0 ? epoch_loss / epoch_preds : 0.0;
+    const float  final_lr = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
+
+    // Complete the progress bar on its own line, then print a dedicated summary.
     std::cout << "\rEpoch " << (ep + 1) << "/" << epoch_ << " | ["
               << std::string(BAR_WIDTH, '#') << "] 100.00%"
-              << " | Avg Loss: " << std::fixed << std::setprecision(4) << avg
-              << " | Done!" << std::endl;
+              << " | LR: " << std::scientific << std::setprecision(2) << final_lr
+              << std::endl;
+
+    std::cout << "  -> Avg loss: " << std::fixed << std::setprecision(6) << avg_loss
+              << "  |  Predictions: " << epoch_preds
+              << "  |  Time: " << std::fixed << std::setprecision(1) << elapsed << "s"
+              << std::endl;
 }
 
 void Trainer::train(const std::string& filename, Vocabulary& vocab,
@@ -308,7 +348,9 @@ void Trainer::train(const std::string& filename, Vocabulary& vocab,
               << " | Threads: " << omp_get_max_threads()
               << " | Window: [1," << window_size_ << "] (sampled)\n"
               << "Subsampling: " << (!vocab.discard_probs_.empty() ? "enabled" : "disabled")
-              << " | SGD: Hogwild (lock-free)\n";
+              << " | SGD: Hogwild (lock-free)"
+              << " | Grad clip: " << (grad_clip_ > 0.0f ? std::to_string(grad_clip_) : "off")
+              << "\n";
 
     for (int ep = 0; ep < epoch_; ++ep) {
         runEpoch(ep, total_samples, global_step, total_steps, filename, vocab,

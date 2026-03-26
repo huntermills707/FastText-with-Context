@@ -16,7 +16,8 @@ public:
     FastTextContext(int dim = 100, int epoch = 5, float lr = 0.05f,
                    int min_n = 3, int max_n = 6, int threshold = 5,
                    int chunk_size = 100000, int ngram_buckets = 2000000,
-                   int window_size = 20, float subsample_t = 1e-4f);
+                   int window_size = 20, float subsample_t = 1e-4f,
+                   float grad_clip = 1.0f);
 
     ~FastTextContext() = default;
 
@@ -42,7 +43,7 @@ public:
 
 private:
     int   dim_, epoch_, min_n_, max_n_, threshold_, chunk_size_, ngram_buckets_, window_size_;
-    float lr_, subsample_t_;
+    float lr_, subsample_t_, grad_clip_;
 
     Vocabulary vocab_;
     Matrix     output_matrix_;         // hierarchical softmax nodes  (V-1 x dim)

@@ -13,6 +13,7 @@ void printUsage(const char* prog) {
               << "  -maxn <int>           Maximum n-gram length (default: 6)\n"
               << "  -threshold <int>      Word frequency threshold (default: 5)\n"
               << "  -subsample <float>    Subsampling threshold t (default: 1e-4)\n"
+              << "  -grad-clip <float>    Gradient norm clip threshold (default: 1.0, 0=off)\n"
               << "  -threads <int>        Number of OpenMP threads (default: system max)\n"
               << "  -chunk-size <int>     Samples per chunk (default: 100000)\n"
               << "  -ngram-buckets <int>  N-gram hash buckets (default: 2000000)\n"
@@ -25,7 +26,7 @@ int main(int argc, char* argv[]) {
     int   dim = 100, epoch = 5, min_n = 3, max_n = 6;
     int   threshold = 5, threads = omp_get_max_threads();
     int   chunk_size = 100000, ngram_buckets = 2000000, window_size = 20;
-    float lr = 0.05f, subsample_t = 1e-4f;
+    float lr = 0.05f, subsample_t = 1e-4f, grad_clip = 1.0f;
     std::string inputFile, outputFile;
 
     for (int i = 1; i < argc; ++i) {
@@ -38,6 +39,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "-maxn"         && i+1 < argc) max_n         = std::stoi(argv[++i]);
         else if (arg == "-threshold"    && i+1 < argc) threshold     = std::stoi(argv[++i]);
         else if (arg == "-subsample"    && i+1 < argc) subsample_t   = std::stof(argv[++i]);
+        else if (arg == "-grad-clip"    && i+1 < argc) grad_clip     = std::stof(argv[++i]);
         else if (arg == "-threads"      && i+1 < argc) threads       = std::stoi(argv[++i]);
         else if (arg == "-chunk-size"   && i+1 < argc) chunk_size    = std::stoi(argv[++i]);
         else if (arg == "-ngram-buckets"&& i+1 < argc) ngram_buckets = std::stoi(argv[++i]);
@@ -65,6 +67,7 @@ int main(int argc, char* argv[]) {
               << "  N-grams:         " << min_n << "-" << max_n << "\n"
               << "  Threshold:       " << threshold       << "\n"
               << "  Subsample t:     " << subsample_t     << "\n"
+              << "  Grad clip:       " << (grad_clip > 0.0f ? std::to_string(grad_clip) : "off") << "\n"
               << "  Window (max):    " << window_size     << "\n"
               << "  Threads:         " << threads         << "\n"
               << "  Chunk size:      " << chunk_size      << "\n"
@@ -74,7 +77,8 @@ int main(int argc, char* argv[]) {
 
     try {
         fasttext::FastTextContext ft(dim, epoch, lr, min_n, max_n, threshold,
-                                     chunk_size, ngram_buckets, window_size, subsample_t);
+                                     chunk_size, ngram_buckets, window_size,
+                                     subsample_t, grad_clip);
         auto t0 = std::chrono::high_resolution_clock::now();
         ft.trainStreaming(inputFile);
         ft.saveModel(outputFile);

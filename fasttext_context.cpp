@@ -11,10 +11,10 @@ namespace fasttext {
 FastTextContext::FastTextContext(int dim, int epoch, float lr,
                                  int min_n, int max_n, int threshold,
                                  int chunk_size, int ngram_buckets,
-                                 int window_size, float subsample_t)
+                                 int window_size, float subsample_t, float grad_clip)
     : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
       threshold_(threshold), chunk_size_(chunk_size), ngram_buckets_(ngram_buckets),
-      window_size_(window_size), subsample_t_(subsample_t) {}
+      window_size_(window_size), subsample_t_(subsample_t), grad_clip_(grad_clip) {}
 
 void FastTextContext::makeInference() {
     inference_ = std::make_unique<Inference>(vocab_, input_matrix_, ngram_matrix_,
@@ -116,7 +116,7 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     makeInference();
 
     Trainer trainer(dim_, epoch_, lr_, min_n_, max_n_,
-                    chunk_size_, ngram_buckets_, window_size_);
+                    chunk_size_, ngram_buckets_, window_size_, grad_clip_);
     trainer.train(filename, vocab_, input_matrix_, output_matrix_,
                   ngram_matrix_, metadata_matrix_);
 

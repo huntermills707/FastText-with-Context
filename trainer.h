@@ -12,8 +12,13 @@ namespace fasttext {
 
 class Trainer {
 public:
+    // grad_clip: maximum L2 norm for gradient vectors before they are applied.
+    // Applied in two places: the per-node output update and the accumulated
+    // center_grad before it is distributed to input/ngram/metadata matrices.
+    // Set to 0.0 to disable clipping entirely.
     Trainer(int dim, int epoch, float lr, int min_n, int max_n,
-            int chunk_size, int ngram_buckets, int window_size = 20);
+            int chunk_size, int ngram_buckets, int window_size = 20,
+            float grad_clip = 1.0f);
 
     // input_matrix: word-level embeddings (vocab_size x dim), new vs. old API.
     void train(const std::string& filename, Vocabulary& vocab,
@@ -24,7 +29,7 @@ public:
 
 private:
     int   dim_, epoch_, min_n_, max_n_, chunk_size_, ngram_buckets_, window_size_;
-    float lr_;
+    float lr_, grad_clip_;
 
     // Per-thread RNGs for subsampling and window-size sampling.
     std::vector<std::mt19937> rngs_;
@@ -34,6 +39,10 @@ private:
     bool             parseLine(const std::string& line, StreamingSample& sample) const;
     int              countLines(const std::string& filename) const;
     bool             checkMatrixHealth(const Matrix& m, const std::string& name, int ep) const;
+
+    // Scales v in-place so its L2 norm does not exceed max_norm.
+    // No-op if max_norm <= 0 or the norm is already within bounds.
+    static void clipNorm(std::vector<float>& v, float max_norm);
 
     // Returns (metadata_vec, active_meta_indices).
     std::pair<std::vector<float>, std::vector<int>>
