@@ -12,7 +12,6 @@ void printUsage(const char* prog) {
               << "Arguments:\n"
               << "  model.bin    Path to the saved model file (required)\n"
               << "  --words1     First set of words (required)\n"
-              << "               (Words are represented by n-grams only, no word embeddings)\n"
               << "  --meta1      Metadata fields for first vector (optional)\n"
               << "  --words2     Second set of words (required)\n"
               << "  --meta2      Metadata fields for second vector (optional)\n"
@@ -25,7 +24,7 @@ void printUsage(const char* prog) {
               << "  # Compare with metadata\n"
               << "  " << prog << " model.bin --words1 bitcoin --meta1 finance bob \\\n"
               << "                         --words2 crypto --meta2 tech alice\n\n"
-              << "  # Same words, different metadata\n"
+              << "  # Same words, different metadata context\n"
               << "  " << prog << " model.bin --words1 market --meta1 finance \\\n"
               << "                         --words2 market --meta2 tech\n"
               << std::endl;
@@ -109,15 +108,14 @@ int main(int argc, char* argv[]) {
         
         std::cout << "Loading model from " << modelFile << "..." << std::endl;
         ft.loadModel(modelFile);
-
-        std::vector<float> test_vec = ft.getWordVector("bitcoin");
-        std::cout << "Debug: bitcoin vector norm = " << std::sqrt(std::inner_product(test_vec.begin(), test_vec.end(), test_vec.begin(), 0.0f)) << std::endl;
-                
-        // Compute combined vectors
+        
+        // getCombinedVector returns L2-normalised vectors, so the dot product
+        // of vec1 and vec2 is the cosine similarity directly.
         std::vector<float> vec1 = ft.getCombinedVector(words1, meta1);
         std::vector<float> vec2 = ft.getCombinedVector(words2, meta2);
         
-        // Check for zero vectors
+        // Norms should be ~1 for non-zero inputs; check anyway to catch
+        // degenerate cases (both word groups empty or entirely OOV with no ngrams).
         float norm1 = 0.0f, norm2 = 0.0f;
         for (float v : vec1) norm1 += v * v;
         for (float v : vec2) norm2 += v * v;
@@ -133,17 +131,12 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         
-        // Compute cosine similarity (vectors are already normalized from getCombinedVector)
-        float dot = 0.0f;
+        // Cosine similarity: vectors are already L2-normalised.
         int dim = ft.getDim();
-        for (int i = 0; i < dim; ++i) {
-            dot += vec1[i] * vec2[i];
-        }
+        float cosine_sim = 0.0f;
+        for (int i = 0; i < dim; ++i) cosine_sim += vec1[i] * vec2[i];
         
-        // Cosine similarity (should be in [-1, 1] for normalized vectors)
-        float cosine_sim = dot;
-        
-        // Compute Euclidean distance
+        // Euclidean distance.
         float euclidean_dist = 0.0f;
         for (int i = 0; i < dim; ++i) {
             float diff = vec1[i] - vec2[i];

@@ -10,6 +10,9 @@ class FastTextContext:
     Changes vs previous version:
     - input_matrix: word-level embedding (vocab_size x dim) loaded between ngram and metadata.
     - get_word_vector: returns word_embedding + ngram_sum (OOV falls back to ngrams only).
+    - get_combined_vector: averages word vectors and metadata vectors within each group,
+      L2-normalises each group, sums the two, then L2-normalises the result. This gives
+      words and metadata strict 50/50 directional contribution regardless of group size.
     """
 
     def __init__(self):
@@ -114,6 +117,14 @@ class FastTextContext:
                 indices.append(self._hash(bordered[i:i+n]) % n_buckets)
         return indices
 
+    @staticmethod
+    def _l2norm(v: np.ndarray) -> np.ndarray:
+        """L2-normalise v in-place and return it. Zero vectors pass through unchanged."""
+        n = np.linalg.norm(v)
+        if n > 1e-8:
+            v /= n
+        return v
+
     def get_word_vector(self, word: str) -> np.ndarray:
         """word_embedding (if in vocab) + sum(ngram_embeddings).
 
@@ -136,30 +147,47 @@ class FastTextContext:
             return self.metadata_matrix[self.metadata2idx[metadata]].copy()
         return np.zeros(self.dim, dtype=np.float32)
 
-    def compute_metadata_vector(self, metadata_list: List[str]) -> np.ndarray:
-        vec = np.zeros(self.dim, dtype=np.float32)
-        for meta in metadata_list:
-            if meta in self.metadata2idx:
-                vec += self.metadata_matrix[self.metadata2idx[meta]]
-        return vec
-
     def get_combined_vector(self, words: List[str],
                             metadata: Optional[List[str]] = None) -> np.ndarray:
-        """Sum of word vectors + metadata vector, L2-normalised."""
-        combined = np.zeros(self.dim, dtype=np.float32)
+        """Average word vectors and average metadata vectors separately, L2-normalise
+        each group, sum the two normalised averages, then L2-normalise the result.
+
+        This gives words and metadata strict 50/50 directional contribution regardless
+        of how many tokens are in each group. If one group is empty its normalised
+        average is the zero vector, so the result collapses to a normalised version of
+        the other group alone.
+        """
+        # Average word vectors.
+        word_avg = np.zeros(self.dim, dtype=np.float32)
         for word in words:
-            combined += self.get_word_vector(word)
+            word_avg += self.get_word_vector(word)
+        if words:
+            word_avg /= len(words)
+
+        # Average metadata vectors (only over fields present in the vocabulary).
+        meta_avg = np.zeros(self.dim, dtype=np.float32)
         if metadata:
-            combined += self.compute_metadata_vector(metadata)
-        norm = np.linalg.norm(combined)
-        if norm > 1e-8:
-            combined /= norm
+            meta_count = 0
+            for meta in metadata:
+                if meta in self.metadata2idx:
+                    meta_avg += self.metadata_matrix[self.metadata2idx[meta]]
+                    meta_count += 1
+            if meta_count > 0:
+                meta_avg /= meta_count
+
+        # Normalise each group before summing so neither dominates by magnitude.
+        self._l2norm(word_avg)
+        self._l2norm(meta_avg)
+
+        combined = word_avg + meta_avg
+        self._l2norm(combined)
+
         return combined
 
     def get_nearest_neighbors(self, words: List[str],
                                metadata: Optional[List[str]] = None,
                                k: int = 10) -> List[Tuple[str, float]]:
-        query      = self.get_combined_vector(words, metadata)
+        query = self.get_combined_vector(words, metadata)
         query_norm = np.linalg.norm(query)
         if query_norm < 1e-8:
             print("Warning: query vector has near-zero magnitude.")
@@ -181,6 +209,8 @@ class FastTextContext:
                         words2: List[str], metadata2: Optional[List[str]]) -> dict:
         v1 = self.get_combined_vector(words1, metadata1)
         v2 = self.get_combined_vector(words2, metadata2)
+        # Both vectors are L2-normalised by get_combined_vector, so the dot
+        # product is the cosine similarity directly.
         cos = float(np.dot(v1, v2))
         return {
             'cosine_similarity':  cos,

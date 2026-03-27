@@ -256,23 +256,54 @@ std::vector<float> FastTextContext::getMetadataVector(const std::string& field) 
     return inference_->getMetadataVector({field});
 }
 
+// Combined vector: average word vectors and average metadata vectors separately,
+// L2-normalise each group, sum the two normalised averages, then L2-normalise
+// the result. This gives words and metadata strict 50/50 directional contribution
+// regardless of how many tokens are in each group.
+//
+// If one group is empty its normalised average is the zero vector, so the
+// combined vector collapses to a normalised version of the other group alone —
+// a smooth, well-defined boundary condition.
 std::vector<float> FastTextContext::getCombinedVector(const std::vector<std::string>& words,
                                                        const std::vector<std::string>& metadata) {
     if (!inference_) throw std::runtime_error("Model not initialised.");
 
-    std::vector<float> combined(dim_, 0.0f);
+    auto l2norm = [&](std::vector<float>& v) {
+        float n = 0.0f;
+        for (float x : v) n += x * x;
+        n = std::sqrt(n);
+        if (n > MIN_NORM) for (float& x : v) x /= n;
+    };
+
+    // Average word vectors.
+    std::vector<float> word_avg(dim_, 0.0f);
     for (const auto& w : words) {
         std::vector<float> wv = getWordVector(w);
-        for (int j = 0; j < dim_; ++j) combined[j] += wv[j];
+        for (int j = 0; j < dim_; ++j) word_avg[j] += wv[j];
     }
-    std::vector<float> mv = inference_->getMetadataVector(metadata);
-    for (int j = 0; j < dim_; ++j) combined[j] += mv[j];
+    if (!words.empty())
+        for (int j = 0; j < dim_; ++j) word_avg[j] /= static_cast<float>(words.size());
 
-    float norm = 0.0f;
-    for (float v : combined) norm += v * v;
-    norm = std::sqrt(norm);
-    if (norm > MIN_NORM)
-        for (int j = 0; j < dim_; ++j) combined[j] /= norm;
+    // Average metadata vectors (only over fields present in the vocabulary).
+    std::vector<float> meta_avg(dim_, 0.0f);
+    int meta_count = 0;
+    for (const auto& meta : metadata) {
+        int idx = vocab_.getMetadataIdx(meta);
+        if (idx < 0) continue;
+        const float* row = metadata_matrix_.row(idx);
+        for (int j = 0; j < dim_; ++j) meta_avg[j] += row[j];
+        ++meta_count;
+    }
+    if (meta_count > 0)
+        for (int j = 0; j < dim_; ++j) meta_avg[j] /= static_cast<float>(meta_count);
+
+    // Normalise each group before summing so neither dominates by magnitude.
+    l2norm(word_avg);
+    l2norm(meta_avg);
+
+    std::vector<float> combined(dim_);
+    for (int j = 0; j < dim_; ++j) combined[j] = word_avg[j] + meta_avg[j];
+    l2norm(combined);
 
     return combined;
 }
