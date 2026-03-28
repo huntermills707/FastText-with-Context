@@ -19,6 +19,11 @@ Trainer::Trainer(int dim, int epoch, float lr, int min_n, int max_n,
     int T = omp_get_max_threads();
     rngs_.resize(T);
     for (int i = 0; i < T; ++i) rngs_[i].seed(std::random_device{}() + i);
+
+    // Pre-allocate per-thread scratch buffers so the hot loop never hits the
+    // allocator.  Each thread exclusively uses its own slot.
+    thread_bufs_.resize(T);
+    for (auto& buf : thread_bufs_) buf.resize(dim);
 }
 
 // Scales v down so ||v||_2 <= max_norm. Direction is preserved.
@@ -38,15 +43,14 @@ uint64_t Trainer::hash(const std::string& str) const {
     return h;
 }
 
-std::vector<int> Trainer::getNgramIndices(const std::string& word) const {
-    std::vector<int> indices;
+void Trainer::getNgramIndices(const std::string& word, std::vector<int>& out) const {
+    out.clear();
     std::string bordered = "<" + word + ">";
     for (int n = min_n_; n <= max_n_; ++n) {
         for (size_t i = 0; i + n <= bordered.size(); ++i) {
-            indices.push_back(static_cast<int>(hash(bordered.substr(i, n)) % ngram_buckets_));
+            out.push_back(static_cast<int>(hash(bordered.substr(i, n)) % ngram_buckets_));
         }
     }
-    return indices;
 }
 
 bool Trainer::parseLine(const std::string& line, StreamingSample& sample) const {
@@ -116,27 +120,30 @@ Trainer::gatherMetadataVec(const StreamingSample& sample, const Vocabulary& voca
     return {vec, active};
 }
 
-std::pair<std::vector<float>, std::vector<int>>
-Trainer::buildCenterVec(int word_idx, const std::string& word,
-                        const Matrix& input_matrix, const Matrix& ngram_matrix,
-                        const std::vector<float>& meta_vec) const {
-    std::vector<float> vec(dim_, 0.0f);
+// Fills pre-allocated out_vec and out_ngram instead of returning newly
+// allocated containers.  This is called once per center word inside the
+// innermost training loop, so avoiding heap traffic matters.
+void Trainer::buildCenterVec(int word_idx, const std::string& word,
+                             const Matrix& input_matrix, const Matrix& ngram_matrix,
+                             const std::vector<float>& meta_vec,
+                             std::vector<float>& out_vec,
+                             std::vector<int>& out_ngram) const {
+    // Zero-fill the output vector (size is guaranteed by caller).
+    std::fill(out_vec.begin(), out_vec.begin() + dim_, 0.0f);
 
     // Word-level embedding.
     const float* wr = input_matrix.row(word_idx);
-    for (int j = 0; j < dim_; ++j) vec[j] += wr[j];
+    for (int j = 0; j < dim_; ++j) out_vec[j] += wr[j];
 
     // N-gram embeddings.
-    std::vector<int> ngram_idx = getNgramIndices(word);
-    for (int idx : ngram_idx) {
+    getNgramIndices(word, out_ngram);
+    for (int idx : out_ngram) {
         const float* nr = ngram_matrix.row(idx);
-        for (int j = 0; j < dim_; ++j) vec[j] += nr[j];
+        for (int j = 0; j < dim_; ++j) out_vec[j] += nr[j];
     }
 
     // Metadata (pre-computed, shared across all center words in the sample).
-    for (int j = 0; j < dim_; ++j) vec[j] += meta_vec[j];
-
-    return {vec, ngram_idx};
+    for (int j = 0; j < dim_; ++j) out_vec[j] += meta_vec[j];
 }
 
 // Follows the word2vec update order:
@@ -144,10 +151,14 @@ Trainer::buildCenterVec(int word_idx, const std::string& word,
 //   2. Compute gradient g = lr * (target - sigmoid).
 //   3. Accumulate input gradient from pre-update output row.
 //   4. Update output row (Hogwild: direct, intentionally racy write).
+//
+// scratch is a pre-allocated dim_-sized buffer used for the output update
+// vector, replacing the per-call allocation in the previous version.
 float Trainer::hsStep(int node_idx, int direction,
                       const std::vector<float>& center_vec,
                       Matrix& output_matrix,
                       std::vector<float>& center_grad,
+                      std::vector<float>& scratch,
                       float lr) {
     const float* out_row = output_matrix.row(node_idx);
 
@@ -162,16 +173,13 @@ float Trainer::hsStep(int node_idx, int direction,
     // Input gradient uses pre-update output row (word2vec ordering).
     for (int j = 0; j < dim_; ++j) center_grad[j] += g * out_row[j];
 
-    // Build the output update vector, clip its norm, then apply (Hogwild).
-    // Rare words have large center_vec (many n-grams summed) and sit deep in
-    // the Huffman tree, making the raw update g * center_vec the primary source
-    // of loss spikes. Norm clipping preserves the update direction.
-    std::vector<float> out_update(dim_);
-    for (int j = 0; j < dim_; ++j) out_update[j] = g * center_vec[j];
-    clipNorm(out_update, grad_clip_);
+    // Build the output update vector in the scratch buffer, clip its norm,
+    // then apply (Hogwild).
+    for (int j = 0; j < dim_; ++j) scratch[j] = g * center_vec[j];
+    clipNorm(scratch, grad_clip_);
 
     float* mut_row = output_matrix.row(node_idx);
-    for (int j = 0; j < dim_; ++j) mut_row[j] += out_update[j];
+    for (int j = 0; j < dim_; ++j) mut_row[j] += scratch[j];
 
     const float p = std::max(1e-7f, std::min(1.0f - 1e-7f, sig));
     return -(target * std::log(p) + (1.0f - target) * std::log(1.0f - p));
@@ -204,6 +212,9 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
     auto [meta_vec, active_meta] = gatherMetadataVec(sample, vocab, metadata_matrix);
     std::uniform_real_distribution<float> ud(0.0f, 1.0f);
 
+    // Grab this thread's pre-allocated scratch buffers.
+    auto& buf = thread_bufs_[tid];
+
     for (int cp = 0; cp < static_cast<int>(sample.words.size()); ++cp) {
         const int cw_idx = vocab.getWordIdx(sample.words[cp]);
         if (cw_idx < 0) continue;
@@ -212,10 +223,12 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
         if (!vocab.discard_probs_.empty() && vocab.discard_probs_[cw_idx] > 0.0f)
             if (ud(rngs_[tid]) < vocab.discard_probs_[cw_idx]) continue;
 
-        auto [center_vec, ngram_idx] = buildCenterVec(
-            cw_idx, sample.words[cp], input_matrix, ngram_matrix, meta_vec);
+        // Build center vector into pre-allocated buffers.
+        buildCenterVec(cw_idx, sample.words[cp], input_matrix, ngram_matrix,
+                       meta_vec, buf.center_vec, buf.ngram_indices);
 
-        std::vector<float> center_grad(dim_, 0.0f);
+        // Zero the gradient accumulator (reuse pre-allocated buffer).
+        std::fill(buf.center_grad.begin(), buf.center_grad.begin() + dim_, 0.0f);
 
         // Sample window size uniformly from [1, window_size_] per center word.
         const int win   = 1 + static_cast<int>(rngs_[tid]() % window_size_);
@@ -235,8 +248,9 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
             const auto& code = vocab.word_codes_[ctx_idx];
 
             for (size_t i = 0; i < path.size(); ++i) {
-                float loss = hsStep(path[i], code[i], center_vec,
-                                    output_matrix, center_grad, lr);
+                float loss = hsStep(path[i], code[i], buf.center_vec,
+                                    output_matrix, buf.center_grad,
+                                    buf.out_update, lr);
                 #pragma omp atomic
                 loss_acc += loss;
                 #pragma omp atomic
@@ -245,14 +259,9 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
         }
 
         // Clip the accumulated input gradient before distributing.
-        // center_grad sums contributions from every (context, Huffman node) pair
-        // in the window. For a rare center word at depth D with window W, this
-        // accumulates up to W * D terms. Norm clipping here prevents that
-        // accumulation from producing a disproportionately large update to the
-        // word embedding, n-gram rows, and metadata rows.
-        clipNorm(center_grad, grad_clip_);
+        clipNorm(buf.center_grad, grad_clip_);
 
-        distributeGrad(center_grad, cw_idx, ngram_idx, active_meta,
+        distributeGrad(buf.center_grad, cw_idx, buf.ngram_indices, active_meta,
                        input_matrix, ngram_matrix, metadata_matrix);
     }
 }

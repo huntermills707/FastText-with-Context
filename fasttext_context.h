@@ -14,9 +14,9 @@ namespace fasttext {
 class FastTextContext {
 public:
     FastTextContext(int dim = 100, int epoch = 5, float lr = 0.05f,
-                   int min_n = 3, int max_n = 6, int threshold = 5,
+                   int min_n = 3, int max_n = 8, int threshold = 5,
                    int chunk_size = 100000, int ngram_buckets = 2000000,
-                   int window_size = 20, float subsample_t = 1e-4f,
+                   int window_size = 5, float subsample_t = 1e-4f,
                    float grad_clip = 1.0f);
 
     ~FastTextContext() = default;

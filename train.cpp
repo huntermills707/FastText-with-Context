@@ -10,22 +10,22 @@ void printUsage(const char* prog) {
               << "  -epoch <int>          Number of training epochs (default: 5)\n"
               << "  -lr <float>           Learning rate (default: 0.05)\n"
               << "  -minn <int>           Minimum n-gram length (default: 3)\n"
-              << "  -maxn <int>           Maximum n-gram length (default: 6)\n"
+              << "  -maxn <int>           Maximum n-gram length (default: 8)\n"
               << "  -threshold <int>      Word frequency threshold (default: 5)\n"
               << "  -subsample <float>    Subsampling threshold t (default: 1e-4)\n"
               << "  -grad-clip <float>    Gradient norm clip threshold (default: 1.0, 0=off)\n"
               << "  -threads <int>        Number of OpenMP threads (default: system max)\n"
               << "  -chunk-size <int>     Samples per chunk (default: 100000)\n"
               << "  -ngram-buckets <int>  N-gram hash buckets (default: 2000000)\n"
-              << "  -window-size <int>    Max skip-gram window size (default: 20)\n"
+              << "  -window-size <int>    Max skip-gram window size (default: 5)\n"
               << "  -help                 Show this help message\n"
               << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-    int   dim = 100, epoch = 5, min_n = 3, max_n = 6;
+    int   dim = 100, epoch = 5, min_n = 3, max_n = 8;
     int   threshold = 5, threads = omp_get_max_threads();
-    int   chunk_size = 100000, ngram_buckets = 2000000, window_size = 20;
+    int   chunk_size = 100000, ngram_buckets = 2000000, window_size = 5;
     float lr = 0.05f, subsample_t = 1e-4f, grad_clip = 1.0f;
     std::string inputFile, outputFile;
 

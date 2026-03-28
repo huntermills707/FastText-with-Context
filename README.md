@@ -74,9 +74,9 @@ alice|tech|2024|Deep learning models improve accuracy
 **Advanced Options:**
 
 ```bash
-./train -dim 200 -epoch 10 -lr 0.05 -minn 3 -maxn 6 -threshold 5 \
+./train -dim 200 -epoch 10 -lr 0.05 -minn 3 -maxn 8 -threshold 5 \
         -threads 8 -chunk-size 100000 -ngram-buckets 2000000 \
-        -window-size 20 -subsample 1e-4 -grad-clip 1.0 \
+        -window-size 5 -subsample 1e-4 -grad-clip 1.0 \
         data.txt model.bin
 ```
 
@@ -86,14 +86,14 @@ alice|tech|2024|Deep learning models improve accuracy
 | `-epoch` | `5` | Number of training epochs |
 | `-lr` | `0.05` | Initial learning rate (linear decay to 0.01% of initial) |
 | `-minn` | `3` | Minimum n-gram length |
-| `-maxn` | `6` | Maximum n-gram length |
+| `-maxn` | `8` | Maximum n-gram length |
 | `-threshold` | `5` | Minimum word frequency to include in vocabulary |
 | `-subsample` | `1e-4` | Subsampling threshold `t`; high-frequency words are discarded with probability `1 - sqrt(t / freq)` |
 | `-grad-clip` | `1.0` | Maximum L2 norm for gradient vectors before they are applied; set to `0` to disable |
 | `-threads` | System max | OpenMP thread count |
 | `-chunk-size` | `100000` | Samples per processing chunk |
 | `-ngram-buckets` | `2000000` | Hash buckets for subword n-gram hashing |
-| `-window-size` | `20` | Maximum skip-gram window size (sampled uniformly from `[1, window-size]` per center word) |
+| `-window-size` | `5` | Maximum skip-gram window size (sampled uniformly from `[1, window-size]` per center word) |
 
 ### 2. Querying (Nearest Neighbors)
 
@@ -201,6 +201,17 @@ print(f"Cosine Similarity: {similarity['cosine_similarity']}")
    - Updates all matrices in-place using **Hogwild** (lock-free, intentionally racy writes) — there is no gradient accumulation buffer or merge step.
    - Gradient norms are clipped at two points: per output-node update and on the accumulated center gradient before it is distributed to the input, n-gram, and metadata matrices.
 5. **Learning Rate**: Decays linearly from `-lr` to `0.01%` of its initial value over the total number of training steps.
+
+### Inference Composition
+
+At inference time the combined vector is computed as:
+
+```
+combined = avg(word_vectors) + sum(metadata_vectors)
+result   = L2_normalise(combined)
+```
+
+This matches the training composition exactly: during training, a single center word vector is summed with all metadata embeddings for the sample (no intermediate normalisation). With multiple query words the average is the natural generalisation of a single word vector. Metadata is summed (not averaged) to preserve the training invariant that more metadata fields contribute more signal. Only one L2 normalisation is applied — to the final composite — so the relative magnitudes of word and metadata contributions are preserved as the model learned them.
 
 ### Memory Layout
 

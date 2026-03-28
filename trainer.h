@@ -17,7 +17,7 @@ public:
     // center_grad before it is distributed to input/ngram/metadata matrices.
     // Set to 0.0 to disable clipping entirely.
     Trainer(int dim, int epoch, float lr, int min_n, int max_n,
-            int chunk_size, int ngram_buckets, int window_size = 20,
+            int chunk_size, int ngram_buckets, int window_size = 5,
             float grad_clip = 1.0f);
 
     // input_matrix: word-level embeddings (vocab_size x dim), new vs. old API.
@@ -34,8 +34,27 @@ private:
     // Per-thread RNGs for subsampling and window-size sampling.
     std::vector<std::mt19937> rngs_;
 
+    // Per-thread scratch buffers to avoid repeated heap allocation inside the
+    // innermost training loop.  Sized once in the constructor and reused for
+    // every call to processSample / buildCenterVec / hsStep.
+    struct ThreadBuffers {
+        std::vector<float> center_vec;
+        std::vector<float> center_grad;
+        std::vector<float> out_update;
+        std::vector<int>   ngram_indices;
+
+        void resize(int dim) {
+            center_vec.resize(dim);
+            center_grad.resize(dim);
+            out_update.resize(dim);
+            // ngram_indices is variable-length; reserve a reasonable amount.
+            ngram_indices.reserve(64);
+        }
+    };
+    std::vector<ThreadBuffers> thread_bufs_;
+
     uint64_t         hash(const std::string& str) const;
-    std::vector<int> getNgramIndices(const std::string& word) const;
+    void             getNgramIndices(const std::string& word, std::vector<int>& out) const;
     bool             parseLine(const std::string& line, StreamingSample& sample) const;
     int              countLines(const std::string& filename) const;
     bool             checkMatrixHealth(const Matrix& m, const std::string& name, int ep) const;
@@ -49,21 +68,26 @@ private:
     gatherMetadataVec(const StreamingSample& sample, const Vocabulary& vocab,
                       const Matrix& metadata_matrix) const;
 
-    // Returns (center_vec, ngram_indices).
+    // Fills out_vec and out_ngram with the composite center vector and its
+    // n-gram indices.  Reuses the caller-provided vectors instead of
+    // allocating new ones.
     // center_vec = word_embedding + sum(ngrams) + metadata_vec.
-    std::pair<std::vector<float>, std::vector<int>>
-    buildCenterVec(int word_idx, const std::string& word,
-                   const Matrix& input_matrix, const Matrix& ngram_matrix,
-                   const std::vector<float>& meta_vec) const;
+    void buildCenterVec(int word_idx, const std::string& word,
+                        const Matrix& input_matrix, const Matrix& ngram_matrix,
+                        const std::vector<float>& meta_vec,
+                        std::vector<float>& out_vec,
+                        std::vector<int>& out_ngram) const;
 
     // Single Huffman-path node forward+backward step.
     // Updates output_matrix in-place (Hogwild), accumulates into center_grad.
+    // Uses scratch as a pre-allocated buffer for the output update vector.
     // Returns binary cross-entropy loss for this node.
     // Ordering matches word2vec: input gradient uses pre-update output row.
     float hsStep(int node_idx, int direction,
                  const std::vector<float>& center_vec,
                  Matrix& output_matrix,
                  std::vector<float>& center_grad,
+                 std::vector<float>& scratch,
                  float lr);
 
     // Distributes center_grad to input_matrix, ngram_matrix, metadata_matrix (Hogwild).

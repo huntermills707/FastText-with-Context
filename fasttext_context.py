@@ -7,12 +7,17 @@ class FastTextContext:
     """
     Python loader for FastTextContext binary models.
 
-    Changes vs previous version:
-    - input_matrix: word-level embedding (vocab_size x dim) loaded between ngram and metadata.
-    - get_word_vector: returns word_embedding + ngram_sum (OOV falls back to ngrams only).
-    - get_combined_vector: averages word vectors and metadata vectors within each group,
-      L2-normalises each group, sums the two, then L2-normalises the result. This gives
-      words and metadata strict 50/50 directional contribution regardless of group size.
+    Composition rule (matching C++ training and inference):
+      combined = avg(word_vectors) + sum(metadata_vectors)
+      result   = L2_normalise(combined)
+
+    During training each center word vector is summed with ALL metadata
+    embeddings for the sample.  At inference with multiple query words the
+    average is the natural generalisation of a single word vector; metadata
+    is summed (not averaged) to preserve the training invariant.  Only one
+    L2 normalisation is applied — to the final composite — so the relative
+    magnitudes of word and metadata contributions are preserved exactly as
+    the model learned them.
     """
 
     def __init__(self):
@@ -149,37 +154,33 @@ class FastTextContext:
 
     def get_combined_vector(self, words: List[str],
                             metadata: Optional[List[str]] = None) -> np.ndarray:
-        """Average word vectors and average metadata vectors separately, L2-normalise
-        each group, sum the two normalised averages, then L2-normalise the result.
+        """avg(word_vectors) + sum(metadata_vectors), then L2-normalise.
 
-        This gives words and metadata strict 50/50 directional contribution regardless
-        of how many tokens are in each group. If one group is empty its normalised
-        average is the zero vector, so the result collapses to a normalised version of
-        the other group alone.
+        Matches the C++ training composition exactly:
+        - During training the center vector is a single word embedding + ngrams
+          summed with ALL metadata embeddings for the sample.
+        - At inference with multiple query words, averaging is the natural
+          generalisation of a single word vector.
+        - Metadata is summed (not averaged) to preserve the training invariant
+          that more metadata fields contribute more signal.
+        - Only one L2 normalisation is applied to the final composite vector,
+          so the relative magnitudes of word and metadata contributions are
+          preserved as the model learned them.
         """
         # Average word vectors.
-        word_avg = np.zeros(self.dim, dtype=np.float32)
+        combined = np.zeros(self.dim, dtype=np.float32)
         for word in words:
-            word_avg += self.get_word_vector(word)
+            combined += self.get_word_vector(word)
         if words:
-            word_avg /= len(words)
+            combined /= len(words)
 
-        # Average metadata vectors (only over fields present in the vocabulary).
-        meta_avg = np.zeros(self.dim, dtype=np.float32)
+        # Sum metadata vectors (matching training: metadata is summed, not averaged).
         if metadata:
-            meta_count = 0
             for meta in metadata:
                 if meta in self.metadata2idx:
-                    meta_avg += self.metadata_matrix[self.metadata2idx[meta]]
-                    meta_count += 1
-            if meta_count > 0:
-                meta_avg /= meta_count
+                    combined += self.metadata_matrix[self.metadata2idx[meta]]
 
-        # Normalise each group before summing so neither dominates by magnitude.
-        self._l2norm(word_avg)
-        self._l2norm(meta_avg)
-
-        combined = word_avg + meta_avg
+        # Single normalisation on the final composite vector.
         self._l2norm(combined)
 
         return combined
