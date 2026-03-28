@@ -20,34 +20,41 @@ public:
             int chunk_size, int ngram_buckets, int window_size = 5,
             float grad_clip = 1.0f);
 
-    // input_matrix: word-level embeddings (vocab_size x dim), new vs. old API.
+    // gate_bias (dim-length) and alpha (metadata_size-length) are passed by
+    // reference and updated in-place during training (Hogwild).
     void train(const std::string& filename, Vocabulary& vocab,
                Matrix& input_matrix,
                Matrix& output_matrix,
                Matrix& ngram_matrix,
-               Matrix& metadata_matrix);
+               Matrix& metadata_matrix,
+               std::vector<float>& gate_bias,
+               std::vector<float>& alpha);
 
 private:
     int   dim_, epoch_, min_n_, max_n_, chunk_size_, ngram_buckets_, window_size_;
     float lr_, grad_clip_;
 
-    // Per-thread RNGs for subsampling and window-size sampling.
     std::vector<std::mt19937> rngs_;
 
-    // Per-thread scratch buffers to avoid repeated heap allocation inside the
-    // innermost training loop.  Sized once in the constructor and reused for
-    // every call to processSample / buildCenterVec / hsStep.
     struct ThreadBuffers {
         std::vector<float> center_vec;
         std::vector<float> center_grad;
         std::vector<float> out_update;
         std::vector<int>   ngram_indices;
+        // New buffers for gated composition.
+        std::vector<float> word_part;      // word_emb + sum(ngrams), before meta added
+        std::vector<float> gate;           // sigmoid(gate_bias + word_part)
+        std::vector<float> meta_vec;       // gated metadata sum for this center word
+        std::vector<float> gate_bias_grad; // gradient w.r.t. gate_bias for this sample
 
         void resize(int dim) {
             center_vec.resize(dim);
             center_grad.resize(dim);
             out_update.resize(dim);
-            // ngram_indices is variable-length; reserve a reasonable amount.
+            word_part.resize(dim);
+            gate.resize(dim);
+            meta_vec.resize(dim);
+            gate_bias_grad.resize(dim);
             ngram_indices.reserve(64);
         }
     };
@@ -59,30 +66,32 @@ private:
     int              countLines(const std::string& filename) const;
     bool             checkMatrixHealth(const Matrix& m, const std::string& name, int ep) const;
 
-    // Scales v in-place so its L2 norm does not exceed max_norm.
-    // No-op if max_norm <= 0 or the norm is already within bounds.
     static void clipNorm(std::vector<float>& v, float max_norm);
 
-    // Returns (metadata_vec, active_meta_indices).
-    std::pair<std::vector<float>, std::vector<int>>
-    gatherMetadataVec(const StreamingSample& sample, const Vocabulary& vocab,
-                      const Matrix& metadata_matrix) const;
+    // Compute gate = sigmoid(gate_bias + word_part) element-wise.
+    // word_part = word_emb + sum(ngrams), so OOV words get a morphologically-
+    // informed gate signal rather than collapsing to sigmoid(gate_bias).
+    void computeGate(const float* word_part,
+                     const std::vector<float>& gate_bias,
+                     std::vector<float>& gate) const;
 
-    // Fills out_vec and out_ngram with the composite center vector and its
-    // n-gram indices.  Reuses the caller-provided vectors instead of
-    // allocating new ones.
-    // center_vec = word_embedding + sum(ngrams) + metadata_vec.
+    // Compute gated metadata vector: sum_k(alpha_k * gate * meta_emb_k).
+    // Returns active metadata indices.
+    std::vector<int> gatherGatedMetaVec(const StreamingSample& sample,
+                                        const Vocabulary& vocab,
+                                        const Matrix& metadata_matrix,
+                                        const std::vector<float>& alpha,
+                                        const std::vector<float>& gate,
+                                        std::vector<float>& out_meta_vec) const;
+
+    // Fills out_vec and out_ngram with center vector using pre-computed meta_vec.
+    // center_vec = word_emb + sum(ngrams) + gated_meta_vec
     void buildCenterVec(int word_idx, const std::string& word,
                         const Matrix& input_matrix, const Matrix& ngram_matrix,
                         const std::vector<float>& meta_vec,
                         std::vector<float>& out_vec,
                         std::vector<int>& out_ngram) const;
 
-    // Single Huffman-path node forward+backward step.
-    // Updates output_matrix in-place (Hogwild), accumulates into center_grad.
-    // Uses scratch as a pre-allocated buffer for the output update vector.
-    // Returns binary cross-entropy loss for this node.
-    // Ordering matches word2vec: input gradient uses pre-update output row.
     float hsStep(int node_idx, int direction,
                  const std::vector<float>& center_vec,
                  Matrix& output_matrix,
@@ -90,23 +99,33 @@ private:
                  std::vector<float>& scratch,
                  float lr);
 
-    // Distributes center_grad to input_matrix, ngram_matrix, metadata_matrix (Hogwild).
+    // Distributes gradients to all parameter matrices including gate_bias and alpha.
     void distributeGrad(const std::vector<float>& center_grad,
-                        int word_idx, const std::vector<int>& ngram_indices,
+                        int word_idx,
+                        const std::vector<int>& ngram_indices,
                         const std::vector<int>& active_meta,
-                        Matrix& input_matrix, Matrix& ngram_matrix,
-                        Matrix& metadata_matrix);
+                        const std::vector<float>& gate,
+                        const std::vector<float>& alpha,
+                        const Matrix& metadata_matrix,
+                        Matrix& input_matrix,
+                        Matrix& ngram_matrix,
+                        Matrix& metadata_matrix_mutable,
+                        std::vector<float>& gate_bias,
+                        std::vector<float>& alpha_mutable,
+                        std::vector<float>& gate_bias_grad_buf,
+                        float lr);
 
-    // Parallel chunk processing (Hogwild: no gradient merge step).
     void processChunk(const std::vector<StreamingSample>& chunk,
                       const Vocabulary& vocab,
                       Matrix& input_matrix, Matrix& output_matrix,
                       Matrix& ngram_matrix, Matrix& metadata_matrix,
+                      std::vector<float>& gate_bias, std::vector<float>& alpha,
                       float lr, double& loss_acc, int& pred_count);
 
     void processSample(const StreamingSample& sample, const Vocabulary& vocab,
                        Matrix& input_matrix, Matrix& output_matrix,
                        Matrix& ngram_matrix, Matrix& metadata_matrix,
+                       std::vector<float>& gate_bias, std::vector<float>& alpha,
                        float lr, int thread_id,
                        double& loss_acc, int& pred_count);
 
@@ -114,7 +133,8 @@ private:
                   long long total_steps, const std::string& filename,
                   Vocabulary& vocab,
                   Matrix& input_matrix, Matrix& output_matrix,
-                  Matrix& ngram_matrix, Matrix& metadata_matrix);
+                  Matrix& ngram_matrix, Matrix& metadata_matrix,
+                  std::vector<float>& gate_bias, std::vector<float>& alpha);
 };
 
 } // namespace fasttext

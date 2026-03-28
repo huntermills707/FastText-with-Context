@@ -18,7 +18,8 @@ FastTextContext::FastTextContext(int dim, int epoch, float lr,
 
 void FastTextContext::makeInference() {
     inference_ = std::make_unique<Inference>(vocab_, input_matrix_, ngram_matrix_,
-                                             metadata_matrix_, min_n_, max_n_);
+                                             metadata_matrix_, gate_bias_, alpha_,
+                                             min_n_, max_n_);
 }
 
 void FastTextContext::initializeMatrices() {
@@ -26,10 +27,18 @@ void FastTextContext::initializeMatrices() {
     const int M  = vocab_.metadataSize();
     const int HS = vocab_.huffmanNodes();
 
-    output_matrix_.resize(HS,           dim_);
-    input_matrix_.resize(V,             dim_);
+    output_matrix_.resize(HS,            dim_);
+    input_matrix_.resize(V,              dim_);
     ngram_matrix_.resize(ngram_buckets_, dim_);
     metadata_matrix_.resize(M,           dim_);
+
+    // Initialize gate_bias to zero: initial gate = sigmoid(word_emb) ≈ 0.5
+    // for small-initialized word embeddings.
+    gate_bias_.assign(dim_, 0.0f);
+
+    // Initialize alpha to 1.0: recovers ~additive behavior (scaled by ~0.5
+    // from the initial gate) and allows the model to learn field importance.
+    alpha_.assign(M, 1.0f);
 
     const int T     = omp_get_max_threads();
     const float scale = 1.0f / std::sqrt(static_cast<float>(dim_));
@@ -53,7 +62,9 @@ void FastTextContext::initializeMatrices() {
 
     std::cout << "Matrices: hs_nodes=" << HS << " vocab=" << V
               << " ngram_buckets=" << ngram_buckets_ << " meta=" << M
-              << " dim=" << dim_ << " threads=" << T << std::endl;
+              << " dim=" << dim_ << " threads=" << T << "\n"
+              << "Gate bias: zeros (dim=" << dim_ << ") | Alpha: ones (meta=" << M << ")"
+              << std::endl;
 }
 
 void FastTextContext::precomputeWordVectors() {
@@ -118,13 +129,13 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     Trainer trainer(dim_, epoch_, lr_, min_n_, max_n_,
                     chunk_size_, ngram_buckets_, window_size_, grad_clip_);
     trainer.train(filename, vocab_, input_matrix_, output_matrix_,
-                  ngram_matrix_, metadata_matrix_);
+                  ngram_matrix_, metadata_matrix_, gate_bias_, alpha_);
 
     precomputeWordVectors();
     std::cout << "\nTraining complete." << std::endl;
 }
 
-// Helper lambdas for serialising/deserialising vector<vector<int>>.
+// Helpers for serialising/deserialising vector<vector<int>>.
 static void writeVecVec(std::ostream& out, const std::vector<std::vector<int>>& vv) {
     for (const auto& v : vv) {
         uint32_t len = static_cast<uint32_t>(v.size());
@@ -143,6 +154,19 @@ static void readVecVec(std::istream& in, std::vector<std::vector<int>>& vv, int 
     }
 }
 
+// Binary format (updated):
+//   [header: dim, min_n, max_n, threshold, window_size]
+//   [sizes: vocab_size, meta_size, ngram_size, output_size]
+//   [word vocabulary entries]
+//   [metadata vocabulary entries]
+//   [output_matrix data]
+//   [ngram_matrix data]
+//   [input_matrix data]
+//   [metadata_matrix data]
+//   [gate_bias: dim floats]          // NEW
+//   [alpha: meta_size floats]        // NEW
+//   [word_codes: vec<vec<int>>]
+//   [word_paths: vec<vec<int>>]
 void FastTextContext::saveModel(const std::string& filename) const {
     std::ofstream out(filename, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot open for writing: " + filename);
@@ -176,11 +200,17 @@ void FastTextContext::saveModel(const std::string& filename) const {
         out.write(reinterpret_cast<const char*>(&i), sizeof(i));
     }
 
-    // Matrix order: output, ngram, input (NEW), metadata.
+    // Matrix order: output, ngram, input, metadata.
     output_matrix_.save(out);
     ngram_matrix_.save(out);
     input_matrix_.save(out);
     metadata_matrix_.save(out);
+
+    // Gated composition parameters (NEW).
+    out.write(reinterpret_cast<const char*>(gate_bias_.data()),
+              static_cast<std::streamsize>(gate_bias_.size() * sizeof(float)));
+    out.write(reinterpret_cast<const char*>(alpha_.data()),
+              static_cast<std::streamsize>(alpha_.size() * sizeof(float)));
 
     writeVecVec(out, vocab_.word_codes_);
     writeVecVec(out, vocab_.word_paths_);
@@ -228,6 +258,14 @@ void FastTextContext::loadModel(const std::string& filename) {
     input_matrix_.load(in);
     metadata_matrix_.load(in);
 
+    // Load gate_bias and alpha (NEW).
+    gate_bias_.resize(dim_);
+    in.read(reinterpret_cast<char*>(gate_bias_.data()), dim_ * sizeof(float));
+
+    alpha_.resize(ms);
+    if (ms > 0)
+        in.read(reinterpret_cast<char*>(alpha_.data()), ms * sizeof(float));
+
     readVecVec(in, vocab_.word_codes_, vs);
     readVecVec(in, vocab_.word_paths_, vs);
 
@@ -256,49 +294,19 @@ std::vector<float> FastTextContext::getMetadataVector(const std::string& field) 
     return inference_->getMetadataVector({field});
 }
 
-// Combined vector: avg(word_vectors) + sum(metadata_vectors), then L2-normalise.
+// Gated combined vector:
+//   word_part = avg(word_emb_i + sum(ngrams_i))
+//   gate      = sigmoid(gate_bias + word_part)    [OOV-safe: ngrams carry the signal]
+//   meta_part = sum_k(alpha_k * gate * meta_emb_k)
+//   combined  = word_part + meta_part
+//   result    = L2_normalise(combined)
 //
-// This matches the training composition where a single center word vector is
-// summed with all metadata embeddings (no intermediate normalisation).  With
-// multiple query words the average is the natural generalisation of a single
-// word vector.  Metadata is summed (not averaged) to preserve the training
-// invariant that more metadata fields contribute more signal.
-//
-// Only one L2 normalisation is applied — to the final result — so the
-// relative magnitudes of word and metadata contributions are preserved
-// exactly as the model learned them.
+// Delegates to Inference::getCombinedVector which holds references to
+// gate_bias_ and alpha_ and implements the same logic.
 std::vector<float> FastTextContext::getCombinedVector(const std::vector<std::string>& words,
                                                        const std::vector<std::string>& metadata) {
     if (!inference_) throw std::runtime_error("Model not initialised.");
-
-    auto l2norm = [&](std::vector<float>& v) {
-        float n = 0.0f;
-        for (float x : v) n += x * x;
-        n = std::sqrt(n);
-        if (n > MIN_NORM) for (float& x : v) x /= n;
-    };
-
-    // Average word vectors.
-    std::vector<float> combined(dim_, 0.0f);
-    for (const auto& w : words) {
-        std::vector<float> wv = getWordVector(w);
-        for (int j = 0; j < dim_; ++j) combined[j] += wv[j];
-    }
-    if (!words.empty())
-        for (int j = 0; j < dim_; ++j) combined[j] /= static_cast<float>(words.size());
-
-    // Sum metadata vectors (matching training: metadata is summed, not averaged).
-    for (const auto& meta : metadata) {
-        int idx = vocab_.getMetadataIdx(meta);
-        if (idx < 0) continue;
-        const float* row = metadata_matrix_.row(idx);
-        for (int j = 0; j < dim_; ++j) combined[j] += row[j];
-    }
-
-    // Single normalisation on the final composite vector.
-    l2norm(combined);
-
-    return combined;
+    return inference_->getCombinedVector(words, metadata);
 }
 
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(

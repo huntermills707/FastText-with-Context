@@ -45,19 +45,6 @@ void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& wor
               << "================================\n" << std::endl;
 }
 
-// Original word2vec two-pointer algorithm.
-//
-// Words are already sorted by frequency descending (index 0 = most frequent).
-// count[0..V-1]   = leaf frequencies (words)
-// count[V..2V-2]  = internal node frequencies, filled left-to-right as created
-//
-// Two pointers scan from opposite ends:
-//   pos1 moves right-to-left through leaves  (sorted desc -> ascending freq from pos1 left)
-//   pos2 moves left-to-right through internals (ascending freq by construction)
-//
-// Each step picks the two globally minimum nodes (min1, min2), creates a parent internal
-// node, and records parent/binary arrays. Internal node i (stored at index V+i) maps to
-// output matrix row i, so path entries are (parent_array_index - V).
 void Vocabulary::buildHuffmanTree() {
     const int V = static_cast<int>(word2idx_.size());
     std::cout << "\n=== HUFFMAN TREE CONSTRUCTION ===\n"
@@ -82,7 +69,6 @@ void Vocabulary::buildHuffmanTree() {
 
     int pos1 = V - 1, pos2 = V;
 
-    // Lambda picks the current minimum between leaf (pos1) and internal (pos2) positions.
     auto pickMin = [&](int& pl, int& pi) -> int {
         if (pl >= 0 && count[pl] <= count[pi]) return pl--;
         return pi++;
@@ -94,10 +80,9 @@ void Vocabulary::buildHuffmanTree() {
         count[i]    = count[min1] + count[min2];
         parent[min1] = i;
         parent[min2] = i;
-        binary[min2] = 1;   // second-minimum child gets code bit 1
+        binary[min2] = 1;
     }
 
-    // Generate codes and paths by tracing each leaf up to the root, then reversing.
     word_codes_.resize(V);
     word_paths_.resize(V);
 
@@ -105,7 +90,7 @@ void Vocabulary::buildHuffmanTree() {
         std::vector<int> code_rev, path_rev;
         for (int n = w; parent[n] != -1; n = parent[n]) {
             code_rev.push_back(binary[n]);
-            path_rev.push_back(parent[n] - V);  // output-matrix row index
+            path_rev.push_back(parent[n] - V);
         }
         std::reverse(code_rev.begin(), code_rev.end());
         std::reverse(path_rev.begin(), path_rev.end());
@@ -118,9 +103,6 @@ void Vocabulary::buildHuffmanTree() {
     std::cout << "=================================\n" << std::endl;
 }
 
-// Discard probability: max(0, 1 - sqrt(t / (freq / total))).
-// A word with relative frequency f is kept with probability ~sqrt(t/f),
-// matching the word2vec subsampling formula.
 void Vocabulary::computeDiscardProbs(float t) {
     const int V = static_cast<int>(word_freqs_.size());
     discard_probs_.resize(V, 0.0f);

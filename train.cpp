@@ -72,7 +72,8 @@ int main(int argc, char* argv[]) {
               << "  Threads:         " << threads         << "\n"
               << "  Chunk size:      " << chunk_size      << "\n"
               << "  N-gram buckets:  " << ngram_buckets   << "\n"
-              << "  Input repr:      word embedding + n-grams + metadata\n"
+              << "  Input repr:      word embedding + n-grams + gated metadata\n"
+              << "  Metadata gate:   word-dependent sigmoid gate + per-field alpha\n"
               << "  SGD:             Hogwild lock-free\n\n";
 
     try {

@@ -20,14 +20,10 @@ Trainer::Trainer(int dim, int epoch, float lr, int min_n, int max_n,
     rngs_.resize(T);
     for (int i = 0; i < T; ++i) rngs_[i].seed(std::random_device{}() + i);
 
-    // Pre-allocate per-thread scratch buffers so the hot loop never hits the
-    // allocator.  Each thread exclusively uses its own slot.
     thread_bufs_.resize(T);
     for (auto& buf : thread_bufs_) buf.resize(dim);
 }
 
-// Scales v down so ||v||_2 <= max_norm. Direction is preserved.
-// A zero vector or max_norm <= 0 passes through unchanged.
 void Trainer::clipNorm(std::vector<float>& v, float max_norm) {
     if (max_norm <= 0.0f) return;
     float norm_sq = 0.0f;
@@ -104,56 +100,57 @@ bool Trainer::checkMatrixHealth(const Matrix& m, const std::string& name, int ep
     return true;
 }
 
-std::pair<std::vector<float>, std::vector<int>>
-Trainer::gatherMetadataVec(const StreamingSample& sample, const Vocabulary& vocab,
-                           const Matrix& metadata_matrix) const {
-    std::vector<float> vec(dim_, 0.0f);
-    std::vector<int>   active;
+void Trainer::computeGate(const float* word_part,
+                           const std::vector<float>& gate_bias,
+                           std::vector<float>& gate) const {
+    for (int j = 0; j < dim_; ++j) {
+        float x = gate_bias[j] + word_part[j];
+        // Clamp to avoid overflow in exp.
+        x = std::max(-20.0f, std::min(20.0f, x));
+        gate[j] = 1.0f / (1.0f + std::exp(-x));
+    }
+}
+
+std::vector<int> Trainer::gatherGatedMetaVec(const StreamingSample& sample,
+                                              const Vocabulary& vocab,
+                                              const Matrix& metadata_matrix,
+                                              const std::vector<float>& alpha,
+                                              const std::vector<float>& gate,
+                                              std::vector<float>& out_meta_vec) const {
+    std::fill(out_meta_vec.begin(), out_meta_vec.begin() + dim_, 0.0f);
+    std::vector<int> active;
 
     for (const auto& meta : sample.metadata_fields) {
         int idx = vocab.getMetadataIdx(meta);
         if (idx < 0) continue;
         const float* row = metadata_matrix.row(idx);
-        for (int j = 0; j < dim_; ++j) vec[j] += row[j];
+        float a = alpha[idx];
+        for (int j = 0; j < dim_; ++j)
+            out_meta_vec[j] += a * gate[j] * row[j];
         active.push_back(idx);
     }
-    return {vec, active};
+    return active;
 }
 
-// Fills pre-allocated out_vec and out_ngram instead of returning newly
-// allocated containers.  This is called once per center word inside the
-// innermost training loop, so avoiding heap traffic matters.
 void Trainer::buildCenterVec(int word_idx, const std::string& word,
-                             const Matrix& input_matrix, const Matrix& ngram_matrix,
-                             const std::vector<float>& meta_vec,
-                             std::vector<float>& out_vec,
-                             std::vector<int>& out_ngram) const {
-    // Zero-fill the output vector (size is guaranteed by caller).
+                              const Matrix& input_matrix, const Matrix& ngram_matrix,
+                              const std::vector<float>& meta_vec,
+                              std::vector<float>& out_vec,
+                              std::vector<int>& out_ngram) const {
     std::fill(out_vec.begin(), out_vec.begin() + dim_, 0.0f);
 
-    // Word-level embedding.
     const float* wr = input_matrix.row(word_idx);
     for (int j = 0; j < dim_; ++j) out_vec[j] += wr[j];
 
-    // N-gram embeddings.
     getNgramIndices(word, out_ngram);
     for (int idx : out_ngram) {
         const float* nr = ngram_matrix.row(idx);
         for (int j = 0; j < dim_; ++j) out_vec[j] += nr[j];
     }
 
-    // Metadata (pre-computed, shared across all center words in the sample).
     for (int j = 0; j < dim_; ++j) out_vec[j] += meta_vec[j];
 }
 
-// Follows the word2vec update order:
-//   1. Dot product and sigmoid using pre-update output row.
-//   2. Compute gradient g = lr * (target - sigmoid).
-//   3. Accumulate input gradient from pre-update output row.
-//   4. Update output row (Hogwild: direct, intentionally racy write).
-//
-// scratch is a pre-allocated dim_-sized buffer used for the output update
-// vector, replacing the per-call allocation in the previous version.
 float Trainer::hsStep(int node_idx, int direction,
                       const std::vector<float>& center_vec,
                       Matrix& output_matrix,
@@ -170,11 +167,8 @@ float Trainer::hsStep(int node_idx, int direction,
     const float target = (direction == 0) ? 1.0f : 0.0f;
     const float g      = lr * (target - sig);
 
-    // Input gradient uses pre-update output row (word2vec ordering).
     for (int j = 0; j < dim_; ++j) center_grad[j] += g * out_row[j];
 
-    // Build the output update vector in the scratch buffer, clip its norm,
-    // then apply (Hogwild).
     for (int j = 0; j < dim_; ++j) scratch[j] = g * center_vec[j];
     clipNorm(scratch, grad_clip_);
 
@@ -185,52 +179,127 @@ float Trainer::hsStep(int node_idx, int direction,
     return -(target * std::log(p) + (1.0f - target) * std::log(1.0f - p));
 }
 
-// Hogwild: direct writes to shared matrices without locks.
-void Trainer::distributeGrad(const std::vector<float>& cg,
-                             int word_idx, const std::vector<int>& ngram_indices,
-                             const std::vector<int>& active_meta,
-                             Matrix& input_matrix, Matrix& ngram_matrix,
-                             Matrix& metadata_matrix) {
-    float* wr = input_matrix.row(word_idx);
-    for (int j = 0; j < dim_; ++j) wr[j] += cg[j];
+// Distributes gradients for gated composition:
+//
+// center_grad flows back through:
+//   (a) word_emb: direct gradient + gate-path gradient
+//   (b) ngram embeddings: direct gradient + gate-path gradient
+//       (ngrams now contribute to the gate signal via word_part, so they share
+//        the same gate-path gradient as word_emb)
+//   (c) meta_emb_k: grad_j = center_grad_j * alpha_k * gate_j
+//   (d) alpha_k: sum_j(center_grad_j * gate_j * meta_emb_k_j)
+//   (e) gate_bias g:
+//       S_j = sum_k(alpha_k * meta_emb_k_j)
+//       gate_grad_j = center_grad_j * S_j * gate_j * (1 - gate_j)
+//       word_emb_j, every ngram_emb_j, and g_j all receive += gate_grad_j
+void Trainer::distributeGrad(const std::vector<float>& center_grad,
+                              int word_idx,
+                              const std::vector<int>& ngram_indices,
+                              const std::vector<int>& active_meta,
+                              const std::vector<float>& gate,
+                              const std::vector<float>& alpha,
+                              const Matrix& metadata_matrix,
+                              Matrix& input_matrix,
+                              Matrix& ngram_matrix,
+                              Matrix& metadata_matrix_mutable,
+                              std::vector<float>& gate_bias,
+                              std::vector<float>& alpha_mutable,
+                              std::vector<float>& gate_bias_grad_buf,
+                              float lr) {
+    // Compute S_j = sum_k(alpha_k * meta_emb_k_j) for gate gradient.
+    std::fill(gate_bias_grad_buf.begin(), gate_bias_grad_buf.begin() + dim_, 0.0f);
+    for (int k : active_meta) {
+        const float* mr = metadata_matrix.row(k);
+        float a = alpha[k];
+        for (int j = 0; j < dim_; ++j)
+            gate_bias_grad_buf[j] += a * mr[j];
+    }
+    // gate_bias_grad_buf now holds S_j.
+    // Multiply by center_grad_j * gate_j * (1 - gate_j) to get gate path gradient.
+    for (int j = 0; j < dim_; ++j)
+        gate_bias_grad_buf[j] *= center_grad[j] * gate[j] * (1.0f - gate[j]);
 
+    // (a) word_emb: direct gradient + gate-path gradient (Hogwild).
+    float* wr = input_matrix.row(word_idx);
+    for (int j = 0; j < dim_; ++j)
+        wr[j] += center_grad[j] + gate_bias_grad_buf[j];
+
+    // (b) ngram embeddings: direct gradient + gate-path gradient.
+    // Ngrams now contribute to the gate signal (via word_part), so they receive
+    // the same gate-path gradient as word_emb.
     for (int idx : ngram_indices) {
         float* nr = ngram_matrix.row(idx);
-        for (int j = 0; j < dim_; ++j) nr[j] += cg[j];
+        for (int j = 0; j < dim_; ++j)
+            nr[j] += center_grad[j] + gate_bias_grad_buf[j];
     }
 
-    for (int idx : active_meta) {
-        float* mr = metadata_matrix.row(idx);
-        for (int j = 0; j < dim_; ++j) mr[j] += cg[j];
+    // (c) + (d) metadata rows and alpha scalars.
+    for (int k : active_meta) {
+        const float* mr_const = metadata_matrix.row(k);
+        float* mr = metadata_matrix_mutable.row(k);
+        float a = alpha[k];
+
+        // Alpha gradient: sum_j(center_grad_j * gate_j * meta_emb_k_j).
+        float alpha_grad = 0.0f;
+        for (int j = 0; j < dim_; ++j)
+            alpha_grad += center_grad[j] * gate[j] * mr_const[j];
+
+        // Clamp alpha gradient by grad_clip_ (scalar version).
+        if (grad_clip_ > 0.0f)
+            alpha_grad = std::max(-grad_clip_, std::min(grad_clip_, alpha_grad));
+        alpha_mutable[k] += alpha_grad;
+
+        // Meta embedding gradient: center_grad_j * alpha_k * gate_j.
+        for (int j = 0; j < dim_; ++j)
+            mr[j] += center_grad[j] * a * gate[j];
     }
+
+    // (e) gate_bias: same gradient as word_emb gate-path (Hogwild).
+    for (int j = 0; j < dim_; ++j)
+        gate_bias[j] += gate_bias_grad_buf[j];
 }
 
 void Trainer::processSample(const StreamingSample& sample, const Vocabulary& vocab,
-                            Matrix& input_matrix, Matrix& output_matrix,
-                            Matrix& ngram_matrix, Matrix& metadata_matrix,
-                            float lr, int tid, double& loss_acc, int& pred_count) {
-    auto [meta_vec, active_meta] = gatherMetadataVec(sample, vocab, metadata_matrix);
+                             Matrix& input_matrix, Matrix& output_matrix,
+                             Matrix& ngram_matrix, Matrix& metadata_matrix,
+                             std::vector<float>& gate_bias, std::vector<float>& alpha,
+                             float lr, int tid,
+                             double& loss_acc, int& pred_count) {
     std::uniform_real_distribution<float> ud(0.0f, 1.0f);
-
-    // Grab this thread's pre-allocated scratch buffers.
     auto& buf = thread_bufs_[tid];
 
     for (int cp = 0; cp < static_cast<int>(sample.words.size()); ++cp) {
         const int cw_idx = vocab.getWordIdx(sample.words[cp]);
         if (cw_idx < 0) continue;
 
-        // Subsample center word.
         if (!vocab.discard_probs_.empty() && vocab.discard_probs_[cw_idx] > 0.0f)
             if (ud(rngs_[tid]) < vocab.discard_probs_[cw_idx]) continue;
 
-        // Build center vector into pre-allocated buffers.
-        buildCenterVec(cw_idx, sample.words[cp], input_matrix, ngram_matrix,
-                       meta_vec, buf.center_vec, buf.ngram_indices);
+        // Build word_part = word_emb + sum(ngrams) into buf.word_part.
+        // This is done before meta is added so the gate has a clean signal.
+        std::fill(buf.word_part.begin(), buf.word_part.begin() + dim_, 0.0f);
+        const float* wr = input_matrix.row(cw_idx);
+        for (int j = 0; j < dim_; ++j) buf.word_part[j] += wr[j];
+        getNgramIndices(sample.words[cp], buf.ngram_indices);
+        for (int idx : buf.ngram_indices) {
+            const float* nr = ngram_matrix.row(idx);
+            for (int j = 0; j < dim_; ++j) buf.word_part[j] += nr[j];
+        }
 
-        // Zero the gradient accumulator (reuse pre-allocated buffer).
+        // Compute gate from word_part (covers OOV words via ngrams).
+        computeGate(buf.word_part.data(), gate_bias, buf.gate);
+
+        // Gather gated metadata vector (per-center-word, because gate depends on word_part).
+        std::vector<int> active_meta = gatherGatedMetaVec(
+            sample, vocab, metadata_matrix, alpha, buf.gate, buf.meta_vec);
+
+        // Final center_vec = word_part + gated_meta.
+        for (int j = 0; j < dim_; ++j)
+            buf.center_vec[j] = buf.word_part[j] + buf.meta_vec[j];
+
+        // Zero gradient accumulator.
         std::fill(buf.center_grad.begin(), buf.center_grad.begin() + dim_, 0.0f);
 
-        // Sample window size uniformly from [1, window_size_] per center word.
         const int win   = 1 + static_cast<int>(rngs_[tid]() % window_size_);
         const int wstart = std::max(0, cp - win);
         const int wend   = std::min(static_cast<int>(sample.words.size()), cp + win + 1);
@@ -240,7 +309,6 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
             const int ctx_idx = vocab.getWordIdx(sample.words[ctx]);
             if (ctx_idx < 0) continue;
 
-            // Subsample context word.
             if (!vocab.discard_probs_.empty() && vocab.discard_probs_[ctx_idx] > 0.0f)
                 if (ud(rngs_[tid]) < vocab.discard_probs_[ctx_idx]) continue;
 
@@ -258,11 +326,14 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
             }
         }
 
-        // Clip the accumulated input gradient before distributing.
+        // Clip accumulated center gradient before distribution.
         clipNorm(buf.center_grad, grad_clip_);
 
         distributeGrad(buf.center_grad, cw_idx, buf.ngram_indices, active_meta,
-                       input_matrix, ngram_matrix, metadata_matrix);
+                       buf.gate, alpha, metadata_matrix,
+                       input_matrix, ngram_matrix, metadata_matrix,
+                       gate_bias, alpha,
+                       buf.gate_bias_grad, lr);
     }
 }
 
@@ -270,11 +341,12 @@ void Trainer::processChunk(const std::vector<StreamingSample>& chunk,
                            const Vocabulary& vocab,
                            Matrix& input_matrix, Matrix& output_matrix,
                            Matrix& ngram_matrix, Matrix& metadata_matrix,
+                           std::vector<float>& gate_bias, std::vector<float>& alpha,
                            float lr, double& loss_acc, int& pred_count) {
     #pragma omp parallel for schedule(dynamic)
     for (int s = 0; s < static_cast<int>(chunk.size()); ++s) {
         processSample(chunk[s], vocab, input_matrix, output_matrix,
-                      ngram_matrix, metadata_matrix, lr,
+                      ngram_matrix, metadata_matrix, gate_bias, alpha, lr,
                       omp_get_thread_num(), loss_acc, pred_count);
     }
 }
@@ -283,7 +355,8 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
                        long long total_steps, const std::string& filename,
                        Vocabulary& vocab,
                        Matrix& input_matrix, Matrix& output_matrix,
-                       Matrix& ngram_matrix, Matrix& metadata_matrix) {
+                       Matrix& ngram_matrix, Matrix& metadata_matrix,
+                       std::vector<float>& gate_bias, std::vector<float>& alpha) {
     std::ifstream file(filename);
     if (!file.is_open()) throw std::runtime_error("Cannot open: " + filename);
 
@@ -302,7 +375,7 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
     auto flushChunk = [&]() {
         float lr = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
         processChunk(chunk, vocab, input_matrix, output_matrix, ngram_matrix, metadata_matrix,
-                     lr, epoch_loss, epoch_preds);
+                     gate_bias, alpha, lr, epoch_loss, epoch_preds);
         global_step += static_cast<long long>(chunk.size());
         processed   += static_cast<int>(chunk.size());
         chunk.clear();
@@ -334,7 +407,6 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
     const double avg_loss = epoch_preds > 0 ? epoch_loss / epoch_preds : 0.0;
     const float  final_lr = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
 
-    // Complete the progress bar on its own line, then print a dedicated summary.
     std::cout << "\rEpoch " << (ep + 1) << "/" << epoch_ << " | ["
               << std::string(BAR_WIDTH, '#') << "] 100.00%"
               << " | LR: " << std::scientific << std::setprecision(2) << final_lr
@@ -348,7 +420,8 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
 
 void Trainer::train(const std::string& filename, Vocabulary& vocab,
                     Matrix& input_matrix, Matrix& output_matrix,
-                    Matrix& ngram_matrix, Matrix& metadata_matrix) {
+                    Matrix& ngram_matrix, Matrix& metadata_matrix,
+                    std::vector<float>& gate_bias, std::vector<float>& alpha) {
     const int       total_samples = countLines(filename);
     const long long total_steps   = static_cast<long long>(total_samples) * epoch_;
     long long       global_step   = 0;
@@ -359,11 +432,13 @@ void Trainer::train(const std::string& filename, Vocabulary& vocab,
               << "Subsampling: " << (!vocab.discard_probs_.empty() ? "enabled" : "disabled")
               << " | SGD: Hogwild (lock-free)"
               << " | Grad clip: " << (grad_clip_ > 0.0f ? std::to_string(grad_clip_) : "off")
+              << " | Gated metadata: word_part gate (OOV-safe)"
               << "\n";
 
     for (int ep = 0; ep < epoch_; ++ep) {
         runEpoch(ep, total_samples, global_step, total_steps, filename, vocab,
-                 input_matrix, output_matrix, ngram_matrix, metadata_matrix);
+                 input_matrix, output_matrix, ngram_matrix, metadata_matrix,
+                 gate_bias, alpha);
 
         bool healthy = checkMatrixHealth(output_matrix,  "output",   ep + 1)
                     && checkMatrixHealth(ngram_matrix,    "ngram",    ep + 1)

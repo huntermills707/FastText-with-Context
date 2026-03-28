@@ -11,11 +11,15 @@ Inference::Inference(const Vocabulary& vocab,
                      const Matrix& input_matrix,
                      const Matrix& ngram_matrix,
                      const Matrix& metadata_matrix,
+                     const std::vector<float>& gate_bias,
+                     const std::vector<float>& alpha,
                      int min_n, int max_n)
     : vocab_(vocab),
       input_matrix_(input_matrix),
       ngram_matrix_(ngram_matrix),
       metadata_matrix_(metadata_matrix),
+      gate_bias_(gate_bias),
+      alpha_(alpha),
       min_n_(min_n), max_n_(max_n),
       dim_(ngram_matrix.cols()) {}
 
@@ -38,8 +42,7 @@ std::vector<int> Inference::getNgramIndices(const std::string& word) const {
 }
 
 // word_embedding (if in vocab) + sum(ngram_embeddings).
-// Out-of-vocabulary words fall back to ngrams only, giving them a nonzero vector
-// derived from morphology alone.
+// OOV words fall back to ngrams only.
 std::vector<float> Inference::getWordVector(const std::string& word) const {
     std::vector<float> vec(dim_, 0.0f);
 
@@ -57,6 +60,7 @@ std::vector<float> Inference::getWordVector(const std::string& word) const {
     return vec;
 }
 
+// Raw sum of metadata embeddings (no gating) — used for diagnostic purposes.
 std::vector<float> Inference::getMetadataVector(const std::vector<std::string>& metadata) const {
     std::vector<float> vec(dim_, 0.0f);
     for (const auto& meta : metadata) {
@@ -68,17 +72,17 @@ std::vector<float> Inference::getMetadataVector(const std::vector<std::string>& 
     return vec;
 }
 
-// Combined vector: avg(word_vectors) + sum(metadata_vectors), then L2-normalise.
+// Gated composition:
+//   word_part = avg(word_emb_i + sum(ngrams_i))   [full word vectors]
+//   gate      = sigmoid(gate_bias + word_part)      [element-wise; OOV-safe via ngrams]
+//   meta_part = sum_k(alpha_k * gate * meta_emb_k)
+//   combined  = word_part + meta_part
+//   result    = L2_normalise(combined)
 //
-// This matches the training composition where a single center word vector is
-// summed with all metadata embeddings (no intermediate normalisation).  With
-// multiple query words the average is the natural generalisation of a single
-// word vector.  Metadata is summed (not averaged) to preserve the training
-// invariant that more metadata fields contribute more signal.
-//
-// Only one L2 normalisation is applied — to the final result — so the
-// relative magnitudes of word and metadata contributions are preserved
-// exactly as the model learned them.
+// Using word_part for the gate ensures OOV words receive a morphologically-
+// informed gate signal via their ngram embeddings rather than collapsing to
+// sigmoid(gate_bias). Only one L2 normalisation is applied to the final
+// composite, preserving the relative word/metadata magnitudes as learned.
 std::vector<float> Inference::getCombinedVector(const std::vector<std::string>& words,
                                                 const std::vector<std::string>& metadata) const {
     auto l2norm = [&](std::vector<float>& v) {
@@ -88,26 +92,42 @@ std::vector<float> Inference::getCombinedVector(const std::vector<std::string>& 
         if (n > MIN_NORM) for (float& x : v) x /= n;
     };
 
-    // Average word vectors.
-    std::vector<float> combined(dim_, 0.0f);
+    std::vector<float> word_part(dim_, 0.0f);
+
     for (const auto& word : words) {
         std::vector<float> wv = getWordVector(word);
-        for (int j = 0; j < dim_; ++j) combined[j] += wv[j];
+        for (int j = 0; j < dim_; ++j) word_part[j] += wv[j];
     }
-    if (!words.empty())
-        for (int j = 0; j < dim_; ++j) combined[j] /= static_cast<float>(words.size());
+    if (!words.empty()) {
+        for (int j = 0; j < dim_; ++j)
+            word_part[j] /= static_cast<float>(words.size());
+    }
 
-    // Sum metadata vectors (matching training: metadata is summed, not averaged).
+    // Compute gate = sigmoid(gate_bias + word_part).
+    std::vector<float> gate(dim_);
+    if (!gate_bias_.empty()) {
+        for (int j = 0; j < dim_; ++j) {
+            float x = gate_bias_[j] + word_part[j];
+            x = std::max(-20.0f, std::min(20.0f, x));
+            gate[j] = 1.0f / (1.0f + std::exp(-x));
+        }
+    } else {
+        // Fallback if gate_bias not available (old model format): gate = 0.5.
+        std::fill(gate.begin(), gate.end(), 0.5f);
+    }
+
+    // Compute gated metadata: sum_k(alpha_k * gate * meta_emb_k).
+    std::vector<float> combined(word_part);
     for (const auto& meta : metadata) {
         int idx = vocab_.getMetadataIdx(meta);
         if (idx < 0) continue;
+        float a = (!alpha_.empty()) ? alpha_[idx] : 1.0f;
         const float* row = metadata_matrix_.row(idx);
-        for (int j = 0; j < dim_; ++j) combined[j] += row[j];
+        for (int j = 0; j < dim_; ++j)
+            combined[j] += a * gate[j] * row[j];
     }
 
-    // Single normalisation on the final composite vector.
     l2norm(combined);
-
     return combined;
 }
 

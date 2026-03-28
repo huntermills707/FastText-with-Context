@@ -15,12 +15,7 @@ public:
     void buildFromCounts(const std::unordered_map<std::string, int>& word_freq,
                          const std::unordered_map<std::string, int>& metadata_freq);
 
-    // Builds Huffman tree using the original word2vec two-pointer algorithm.
-    // Internal nodes are indexed 0..V-2 in the output matrix.
     void buildHuffmanTree();
-
-    // Precomputes per-word discard probability: 1 - sqrt(t / (freq/total)).
-    // Call after buildHuffmanTree.
     void computeDiscardProbs(float t);
 
     inline int getWordIdx(const std::string& word) const {
@@ -47,7 +42,6 @@ public:
 
     inline int wordSize()     const { return static_cast<int>(word2idx_.size()); }
     inline int metadataSize() const { return static_cast<int>(metadata2idx_.size()); }
-    // V-1 internal nodes in the Huffman tree == rows in the output (HS) matrix.
     inline int huffmanNodes() const { return std::max(1, wordSize() - 1); }
 
     void addWord(int idx, const std::string& word) {
@@ -62,11 +56,10 @@ public:
         idx2metadata_[idx] = meta;
     }
 
-    // Public: accessed directly by Trainer and Inference.
     std::vector<std::vector<int>> word_codes_;
     std::vector<std::vector<int>> word_paths_;
     std::vector<double>           word_freqs_;
-    std::vector<float>            discard_probs_;  // per-word subsampling discard probability
+    std::vector<float>            discard_probs_;
 
     void diagnose() const;
 

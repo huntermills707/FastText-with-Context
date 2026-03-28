@@ -41,6 +41,10 @@ public:
     int getNgramBuckets() const { return ngram_buckets_; }
     int getWindowSize()   const { return window_size_; }
 
+    // Diagnostic accessors for gate_bias and alpha after training.
+    const std::vector<float>& getGateBias() const { return gate_bias_; }
+    const std::vector<float>& getAlpha()    const { return alpha_; }
+
 private:
     int   dim_, epoch_, min_n_, max_n_, threshold_, chunk_size_, ngram_buckets_, window_size_;
     float lr_, subsample_t_, grad_clip_;
@@ -51,6 +55,10 @@ private:
     Matrix     ngram_matrix_;          // subword n-gram embeddings    (ngram_buckets x dim)
     Matrix     metadata_matrix_;       // metadata field embeddings    (meta_size x dim)
     Matrix     cached_word_vectors_;   // precomputed for fast NN search
+
+    // Gated metadata composition parameters.
+    std::vector<float> gate_bias_;     // learned gate bias vector, length dim
+    std::vector<float> alpha_;         // learned per-metadata-field scalar weights, length meta_size
 
     std::unique_ptr<Inference> inference_;
 
