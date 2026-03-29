@@ -127,7 +127,7 @@ private:
                        Matrix& patient_matrix,  // thread-local
                        Matrix& provider_matrix, // thread-local
                        float lr, int tid,
-                       double& loss_acc, int& pred_count);
+                       double& loss_acc, long long& pred_count);
 
     void processChunk(const std::vector<GroupedSample>& chunk,
                       const Vocabulary& vocab,
@@ -136,7 +136,7 @@ private:
                       Matrix& W_proj,
                       Matrix& patient_matrix,
                       Matrix& provider_matrix,
-                      float lr, double& loss_acc, int& pred_count);
+                      float lr, double& loss_acc, long long& pred_count);
 
     void runEpoch(int ep, int total_samples, long long& global_step,
                   long long total_steps, const std::string& filename,

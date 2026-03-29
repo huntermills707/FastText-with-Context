@@ -337,7 +337,7 @@ void Trainer::processSample(const GroupedSample& sample,
                             Matrix& patient_matrix,
                             Matrix& provider_matrix,
                             float lr, int tid,
-                            double& loss_acc, int& pred_count) {
+                            double& loss_acc, long long& pred_count) {
     std::uniform_real_distribution<float> ud(0.0f, 1.0f);
     auto& buf = thread_bufs_[tid];
 
@@ -410,7 +410,7 @@ void Trainer::processChunk(const std::vector<GroupedSample>& chunk,
                            Matrix& W_proj,
                            Matrix& patient_matrix,
                            Matrix& provider_matrix,
-                           float lr, double& loss_acc, int& pred_count) {
+                           float lr, double& loss_acc, long long& pred_count) {
     // BROADCAST: shared → thread-local.
     broadcastDenseParams(W_proj, patient_matrix, provider_matrix);
 
@@ -442,8 +442,9 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
 
     const auto epoch_start = std::chrono::steady_clock::now();
 
-    double epoch_loss  = 0.0;
-    int    epoch_preds = 0, processed = 0, last_reported = 0;
+    double    epoch_loss  = 0.0;
+    long long epoch_preds = 0;
+    int       processed = 0, last_reported = 0;
     const float LR_FLOOR = lr_ * 0.0001f;
     const int   BAR_WIDTH = 40;
 
