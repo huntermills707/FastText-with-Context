@@ -1,169 +1,179 @@
 # FastTextContext
 
-A high-performance, custom C++ implementation of FastText extended with additive metadata embeddings. Built from scratch with OpenMP parallelization, this library supports streaming training on large datasets and allows word vectors to be dynamically conditioned on metadata (e.g., author, domain, timestamp).
+A high-performance C++ implementation of FastText extended with a **concatenation-with-projection** architecture for stratified metadata groups. Built from scratch with OpenMP parallelization, it supports streaming training on large datasets and learns separate low-dimensional embeddings for each metadata group (patients, providers), which are concatenated and projected into a shared output space.
 
 ## Key Features
 
-- **Additive Metadata Modeling**: Unlike standard FastText, this implementation learns separate embeddings for metadata fields and adds them element-wise to word vectors during training and inference.
-  - Formula: `combined_vector = word_embedding + sum(ngram_embeddings) + sum(metadata_embeddings)`
-- **Streaming Training**: Two-pass architecture (vocabulary counting → training) designed to handle datasets larger than RAM.
-- **Hierarchical Softmax**: Optimized training using Huffman trees for logarithmic complexity relative to vocabulary size.
-- **Subword Awareness**: Character n-grams (configurable range) handle out-of-vocabulary words and morphological variations.
-- **Multi-threaded**: Full OpenMP integration for parallel matrix initialization, gradient updates (Hogwild), and nearest-neighbor search.
+- **Stratified Metadata Groups**: Each metadata group (patient demographics, provider role) gets its own embedding space and dimension. Groups are concatenated and projected through a learned matrix rather than additively combined.
+  - Forward pass: `concat = [word_part ; patient_avg ; provider_avg]` → `center_vec = W_proj × concat`
+  - Extensible: adding a fourth group (e.g. outcomes) requires only a new embedding matrix and widening `W_proj` by `d_outcome` columns.
+- **Hybrid Optimization**: Sparse word and n-gram parameters use Hogwild lock-free SGD. Dense parameters (`W_proj`, patient embeddings, provider embeddings) use thread-local copies with periodic synchronized averaging — one sync point per chunk, not per sample.
+- **Streaming Training**: Two-pass architecture (vocabulary counting → training) handles datasets larger than RAM.
+- **Hierarchical Softmax**: Huffman tree construction for O(log V) training complexity.
+- **Subword Awareness**: Character n-grams (configurable range) handle out-of-vocabulary words.
 - **Three Binaries**:
   - `train`: Streamlined training pipeline.
-  - `query`: Interactive nearest-neighbor search with metadata support.
-  - `compare`: Cosine/Euclidean similarity analysis between complex word + metadata combinations.
-- **Python Compatibility**: Includes a pure Python loader (`fasttext_context.py`) for easy integration into data science workflows.
+  - `query`: Interactive nearest-neighbor search with grouped metadata.
+  - `compare`: Cosine/Euclidean similarity between complex word + metadata combinations.
+- **Python Loader**: Pure-numpy `fasttext_context.py` for inference and diagnostics without recompiling.
 
 ## Prerequisites
 
-- **Compiler**: GCC 7+ or Clang 5+ (C++17 support required)
-- **Libraries**: OpenMP (`libomp` or `libgomp`)
-- **Python** (optional, for the loader script): `numpy`
+- **Compiler**: GCC 7+ or Clang 5+ (C++17 required)
+- **Libraries**: OpenMP (`libgomp` or `libomp`)
+- **Python** (optional): `numpy`
 
 ## Building
 
-The project uses a simple Makefile.
-
 ```bash
-# Clone or copy source files
-cd FastTextContext
-
-# Build all binaries (train, query, compare)
-make all
-
-# Build individually
-make train
-make query
-make compare
-
-# Clean build artifacts
+make all      # build train, query, compare
 make clean
 ```
 
-### Compiler Flags
+Default compiler flags: `-O3 -std=c++17 -march=native -fopenmp`
 
-The default build uses aggressive optimization:
+## Data Format
 
-```makefile
-CXX = g++
-CXXFLAGS = -O3 -std=c++17 -march=native -fopenmp
+Input lines use triple-pipe delimiters between groups:
+
+```
+<PatientGroup> ||| <ProviderGroup> ||| <WordsGroup>
+```
+
+- Each group's tokens are space-delimited.
+- Individual tokens contain no internal spaces (use underscores).
+- Groups may be empty; the delimiters are always present.
+- The words group is always last.
+
+**Examples:**
+
+```
+elderly male white english medicare married ||| attending emergency ||| the patient was admitted with chest pain
+aged female hispanic ||| resident_physician elective ||| scheduled for elective knee replacement
+ ||| nurse urgent ||| vital signs were stable on admission
+elderly male ||| ||| no acute distress noted on examination
+```
+
+A synthetic data generator is included:
+
+```bash
+python3 generate_sentences.py   # writes training_data_with_context.txt (1M rows)
 ```
 
 ## Usage
 
 ### 1. Training
 
-The training process reads a pipe-delimited text file where the last field is the sentence and all preceding fields are metadata.
-
-**Data Format Example (`data.txt`):**
-
-```text
-alice|tech|Machine learning is advancing rapidly
-bob|finance|Bitcoin prices fluctuate wildly
-alice|tech|2024|Deep learning models improve accuracy
+```bash
+./train [options] <training_file> <output_model.bin>
 ```
 
-**Basic Command:**
+**Basic command:**
 
 ```bash
 ./train data.txt model.bin
 ```
 
-**Advanced Options:**
+**Full example (MIMIC-III scale):**
 
 ```bash
-./train -dim 200 -epoch 10 -lr 0.05 -minn 3 -maxn 8 -threshold 5 \
-        -threads 8 -chunk-size 100000 -ngram-buckets 2000000 \
-        -window-size 5 -subsample 1e-4 -grad-clip 1.0 \
-        data.txt model.bin
+./train -d-word 150 -d-patient 30 -d-provider 15 -d-out 150 \
+        -epoch 10 -lr 0.05 -chunk-size 1000 -threads 8 \
+        -weight-decay 1e-5 -grad-clip 1.0 \
+        mimic-iii-sents.txt model.bin
 ```
+
+**All flags:**
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `-dim` | `100` | Embedding dimension |
-| `-epoch` | `5` | Number of training epochs |
+| `-d-word` | `150` | Word + n-gram embedding dimension |
+| `-d-patient` | `30` | Patient group embedding dimension |
+| `-d-provider` | `15` | Provider group embedding dimension |
+| `-d-out` | `150` | Output/projected dimension (HS and NN search operate here) |
+| `-epoch` | `5` | Training epochs |
 | `-lr` | `0.05` | Initial learning rate (linear decay to 0.01% of initial) |
-| `-minn` | `3` | Minimum n-gram length |
-| `-maxn` | `8` | Maximum n-gram length |
-| `-threshold` | `5` | Minimum word frequency to include in vocabulary |
-| `-subsample` | `1e-4` | Subsampling threshold `t`; high-frequency words are discarded with probability `1 - sqrt(t / freq)` |
-| `-grad-clip` | `1.0` | Maximum L2 norm for gradient vectors before they are applied; set to `0` to disable |
-| `-threads` | System max | OpenMP thread count |
-| `-chunk-size` | `100000` | Samples per processing chunk |
-| `-ngram-buckets` | `2000000` | Hash buckets for subword n-gram hashing |
-| `-window-size` | `5` | Maximum skip-gram window size (sampled uniformly from `[1, window-size]` per center word) |
+| `-minn` | `3` | Minimum character n-gram length |
+| `-maxn` | `8` | Maximum character n-gram length |
+| `-threshold` | `5` | Minimum word frequency; patient/provider fields are not filtered |
+| `-subsample` | `1e-4` | Subsampling threshold `t`; high-frequency words skipped with prob `1 - sqrt(t/freq)` |
+| `-grad-clip` | `1.0` | Max L2 norm for gradient vectors (0 = off) |
+| `-weight-decay` | `0` | L2 decay applied to `W_proj` after each chunk reduce (e.g. `1e-5`); 0 = off |
+| `-threads` | system max | OpenMP thread count |
+| `-chunk-size` | `1000` | Samples per broadcast→process→reduce sync cycle |
+| `-ngram-buckets` | `2000000` | Hash buckets for character n-gram embeddings |
+| `-window-size` | `5` | Max skip-gram window size (sampled uniformly from `[1, window-size]`) |
 
 ### 2. Querying (Nearest Neighbors)
 
-Find words semantically similar to a query, optionally conditioned on metadata.
-
-**Syntax:**
+Find words semantically similar to a query, optionally conditioned on grouped metadata.
 
 ```bash
-./query <model.bin> <word1> [word2 ...] [--ctx <meta1> [meta2 ...]] [--k <num>]
+./query <model.bin> <word1> [word2 ...] [--patient <p1> [p2 ...]] [--provider <pr1> [pr2 ...]] [--k <num>]
 ```
 
 **Examples:**
 
 ```bash
-# Find neighbors of "machine" with no metadata
-./query model.bin machine --k 10
+# Words only
+./query model.bin chest pain --k 10
 
-# Find neighbors of "bitcoin" conditioned on metadata "finance" and "bob"
-./query model.bin bitcoin --ctx finance bob --k 10
+# Words + full context
+./query model.bin chest pain \
+    --patient elderly male white medicare \
+    --provider attending emergency \
+    --k 10
 
-# Combine multiple words and metadata
-./query model.bin machine learning --ctx alice tech --k 20
+# Words + patient context only
+./query model.bin chest pain --patient young_adult female --k 5
 ```
 
 ### 3. Comparing Vectors
 
-Calculate similarity metrics between two complex queries (words + metadata).
-
-**Syntax:**
+Calculate similarity metrics between two queries, each with independent metadata context.
 
 ```bash
 ./compare <model.bin> \
-    --words1 <w1> [w2 ...] [--meta1 <m1> [m2 ...]] \
-    --words2 <w1> [w2 ...] [--meta2 <m1> [m2 ...]]
+    --words1 <w1> [w2 ...] [--patient1 <p1> ...] [--provider1 <pr1> ...] \
+    --words2 <w1> [w2 ...] [--patient2 <p1> ...] [--provider2 <pr1> ...]
 ```
 
 **Examples:**
 
 ```bash
-# Compare two single words
-./compare model.bin --words1 machine --words2 computer
+# Same words, different patient demographics
+./compare model.bin \
+    --words1 chest pain --patient1 elderly male \
+    --words2 chest pain --patient2 young_adult female
 
-# Compare word combinations
-./compare model.bin --words1 machine learning --words2 neural networks
+# Same words, different provider context
+./compare model.bin \
+    --words1 shortness of breath --provider1 attending emergency \
+    --words2 shortness of breath --provider2 resident elective
 
-# Same word, different metadata context
-./compare model.bin --words1 market --meta1 finance --words2 market --meta2 tech
-
-# Combine multiple words and metadata
-./compare model.bin --words1 bitcoin --meta1 finance bob \
-                    --words2 crypto  --meta2 tech alice
+# Full context comparison
+./compare model.bin \
+    --words1 pain --patient1 elderly male white medicare --provider1 attending \
+    --words2 pain --patient2 adult female hispanic medicaid --provider2 nurse
 ```
 
-**Output includes:**
-- Cosine Similarity
-- Cosine Distance
-- Euclidean Distance
-- Semantic interpretation hint
+**Output:**
+
+```
+--- Similarity Metrics ---
+  Cosine Similarity:  0.832541
+  Cosine Distance:    0.167459
+  Euclidean Distance: 0.578012
+
+--- Interpretation ---
+  Very similar
+```
 
 ## Python Integration
-
-A Python loader is provided to load the binary model and perform inference without compiling C++.
-
-**Installation:**
 
 ```bash
 pip install numpy
 ```
-
-**Usage:**
 
 ```python
 from fasttext_context import FastTextContext
@@ -171,65 +181,180 @@ from fasttext_context import FastTextContext
 ft = FastTextContext()
 ft.load_model("model.bin")
 
-# Get word vector (word embedding + n-gram embeddings)
-vec = ft.get_word_vector("machine")
+# Raw word vector (d_w-dimensional, unprojected)
+vec = ft.get_word_vector("pain")
 
-# Get combined vector (words + metadata), L2-normalised
-combined = ft.get_combined_vector(["bitcoin"], ["finance"])
+# Combined vector (all groups, projected, L2-normalised, d_out-dimensional)
+combined = ft.get_combined_vector(
+    words=["chest", "pain"],
+    patient_meta=["elderly", "male"],
+    provider_meta=["attending"]
+)
 
-# Find nearest neighbors
-neighbors = ft.get_nearest_neighbors(["bitcoin"], ["finance"], k=5)
+# Group ablation: any subset of groups, absent ones are zeroed
+words_only    = ft.get_group_vector(words=["chest", "pain"])
+with_patient  = ft.get_group_vector(words=["chest", "pain"], patient_meta=["elderly"])
+with_provider = ft.get_group_vector(words=["chest", "pain"], provider_meta=["attending"])
+
+# Nearest neighbors
+neighbors = ft.get_nearest_neighbors(
+    ["chest", "pain"],
+    patient_meta=["elderly", "male"],
+    k=10
+)
 for word, score in neighbors:
     print(f"{word}: {score:.4f}")
 
-# Compare two concepts
-similarity = ft.compare_vectors(["market"], ["finance"], ["market"], ["tech"])
-print(f"Cosine Similarity: {similarity['cosine_similarity']}")
+# Compare two contexts
+result = ft.compare_vectors(
+    ["pain"], ["elderly"], ["attending"],
+    ["pain"], ["young_adult"], ["resident"]
+)
+print(result["cosine_similarity"])
+
+# Diagnostics
+ft.print_projection_block_norms()  # check word/patient/provider blocks in W_proj
+ft.print_patient_vocab()
+ft.print_provider_vocab()
 ```
 
-## Architecture Overview
+## Architecture
 
-### Data Flow
+### Dimensions
 
-1. **Pass 1 (Vocabulary)**: Scans the input file to count word and metadata frequencies. Words below `-threshold` are filtered out.
-2. **Huffman Tree**: Constructs a binary tree based on word frequencies using the original word2vec two-pointer algorithm. Internal nodes are indexed into the output (hierarchical softmax) matrix.
-3. **Initialization**: All matrices (input, output, n-gram, metadata) are initialized with values sampled from `N(0, 1/sqrt(dim))` using thread-local RNGs.
-4. **Pass 2 (Training)**:
-   - Parses lines into `StreamingSample` objects, buffered in chunks.
-   - For each center word, builds `center_vec = word_embedding + sum(ngram_embeddings) + sum(metadata_embeddings)`.
-   - Performs a forward/backward pass along the Huffman path for each context word (hierarchical softmax).
-   - Updates all matrices in-place using **Hogwild** (lock-free, intentionally racy writes) — there is no gradient accumulation buffer or merge step.
-   - Gradient norms are clipped at two points: per output-node update and on the accumulated center gradient before it is distributed to the input, n-gram, and metadata matrices.
-5. **Learning Rate**: Decays linearly from `-lr` to `0.01%` of its initial value over the total number of training steps.
+| Symbol | Default | Description |
+| :--- | :--- | :--- |
+| `d_w` | 150 | Word + n-gram embedding space |
+| `d_p` | 30 | Patient group embedding space |
+| `d_pr` | 15 | Provider group embedding space |
+| `d_out` | 150 | Projected output space (HS and NN search) |
+| `concat_dim` | 195 | `d_w + d_p + d_pr` |
+| `W_proj` | 150 × 195 | 29,250 parameters |
+
+### Forward Pass (Single Center Word)
+
+```
+word_part    = word_emb[w] + sum(ngram_embs[w])           ∈ R^d_w
+patient_part = avg(patient_embs[active patient fields])   ∈ R^d_p   (zero if none)
+provider_part= avg(provider_embs[active provider fields]) ∈ R^d_pr  (zero if none)
+
+concat       = [word_part ; patient_part ; provider_part] ∈ R^concat_dim
+center_vec   = W_proj × concat                            ∈ R^d_out
+```
+
+The `center_vec` enters the standard skip-gram hierarchical softmax loop unchanged.
+
+### Backward Pass Through Projection
+
+After accumulating `center_grad ∈ R^d_out` from the HS loop (and clipping by L2 norm):
+
+```
+concat_grad  = W_proj^T × center_grad        (matrix-vector, concat_dim FLOPs)
+W_proj      += lr × center_grad × concat^T   (outer product update, thread-local)
+```
+
+`concat_grad` is sliced into `word_grad`, `patient_grad`, `provider_grad` and distributed:
+
+- `word_grad` → `input_matrix[word]` and each `ngram_matrix[idx]` (Hogwild)
+- `patient_grad / N_patient` → each active `patient_matrix[idx]` (thread-local)
+- `provider_grad / N_provider` → each active `provider_matrix[idx]` (thread-local)
+
+### Synchronization Protocol
+
+Dense parameters (`W_proj`, `patient_matrix`, `provider_matrix`) use thread-local copies with a per-chunk broadcast → process → reduce cycle:
+
+1. **Broadcast**: copy shared dense params to all thread-local copies (sequential, before parallel region)
+2. **Process**: threads update their local copies in parallel (no contention on dense params)
+3. **Reduce**: average all thread-local copies back to shared (sequential, after barrier)
+
+Sparse parameters (`input_matrix`, `ngram_matrix`, `output_matrix`) use Hogwild lock-free writes throughout.
+
+This approach has one synchronization point per 1000 samples rather than one per center word — roughly 10,000× less frequent than a mutex-per-update approach, with no atomic float overhead.
 
 ### Inference Composition
 
-At inference time the combined vector is computed as:
+At query time:
 
 ```
-combined = avg(word_vectors) + sum(metadata_vectors)
-result   = L2_normalise(combined)
+concat  = [avg(word_vecs) ; avg(patient_vecs) ; avg(provider_vecs)]
+result  = L2_normalise(W_proj × concat)
 ```
 
-This matches the training composition exactly: during training, a single center word vector is summed with all metadata embeddings for the sample (no intermediate normalisation). With multiple query words the average is the natural generalisation of a single word vector. Metadata is summed (not averaged) to preserve the training invariant that more metadata fields contribute more signal. Only one L2 normalisation is applied — to the final composite — so the relative magnitudes of word and metadata contributions are preserved as the model learned them.
+For nearest-neighbor search, a cache of precomputed word-only projected vectors (`vocab_size × d_out`) is held in memory. Candidate scoring uses this cache; the query vector includes metadata. Both live in the same `d_out` space so cosine similarity is well-defined.
 
 ### Memory Layout
 
-| Matrix | Shape | Description |
+| Matrix | Shape | Update strategy |
 | :--- | :--- | :--- |
-| Input | `(vocab_size, dim)` | Word-level embeddings |
-| N-gram | `(ngram_buckets, dim)` | Subword character n-gram embeddings |
-| Metadata | `(metadata_size, dim)` | Metadata field embeddings |
-| Output | `(vocab_size - 1, dim)` | Hierarchical softmax internal node weights |
+| `input_matrix` | `vocab_size × d_w` | Hogwild |
+| `ngram_matrix` | `ngram_buckets × d_w` | Hogwild |
+| `output_matrix` | `(vocab_size-1) × d_out` | Hogwild |
+| `W_proj` | `d_out × concat_dim` | Thread-local + chunk average |
+| `patient_matrix` | `patient_vocab × d_p` | Thread-local + chunk average |
+| `provider_matrix` | `provider_vocab × d_pr` | Thread-local + chunk average |
 
-At inference time a `(vocab_size, dim)` cache of precomputed word vectors (word embedding + n-gram sum) is held in memory to accelerate nearest-neighbor search.
+### Extending to a Fourth Group
+
+To add an outcome group (dimension `d_o`):
+
+1. Add `outcome_fields` to `GroupedSample` in `types.h`.
+2. Add `outcome2idx_` / `outcomeSize()` to `Vocabulary`.
+3. Add `outcome_matrix_` (`outcome_vocab × d_o`) to `FastTextContext` and `Trainer`.
+4. Widen `W_proj` from `d_out × (d_w+d_p+d_pr)` to `d_out × (d_w+d_p+d_pr+d_o)`.
+5. Extend `buildConcatVec`, `distributeGrad`, `getCombinedVector`, and the Python loader to handle the new slice.
+
+No structural changes to the HS loop, synchronization protocol, or save/load format beyond the new sizes.
+
+## MIMIC-III Preprocessing
+
+The preprocessing script at `mimic-iii/mimic-iii-preprocess.py` reads ADMISSIONS, PATIENTS, CAREGIVERS, and NOTEEVENTS, cleans and sentence-segments clinical notes, and writes the triple-pipe format:
+
+```
+elderly male white english medicare ||| attending emergency ||| the patient presented with dyspnea
+```
+
+Patient columns: MeSH age category, gender, ethnicity, language, religion, marital status, insurance.
+Provider columns: caregiver title, admission type.
+
+```bash
+cd mimic-iii
+python3 mimic-iii-preprocess.py   # writes mimic-iii-sents.txt
+```
 
 ## Performance Tuning
 
-- **Memory**: Decrease `-ngram-buckets` (e.g., to `1000000`) or `-dim` for smaller models.
-- **Speed**: Increase `-chunk-size` to amortize file I/O overhead; tune `-threads` to match your CPU core count.
-- **Quality**: Increase `-epoch` and lower `-threshold` for better coverage of rare words, at the cost of training time. Lower `-subsample` (e.g., `1e-5`) to retain more high-frequency words.
-- **Stability**: If training diverges, reduce `-lr` or tighten `-grad-clip`.
+- **Memory**: reduce `-ngram-buckets` (e.g. `1000000`) or `-d-word` for smaller models.
+- **Speed**: reduce `-chunk-size` if threads sit idle between syncs; increase it if sync overhead is visible in profiling. Tune `-threads` to physical core count.
+- **Quality**: increase `-epoch` and lower `-threshold`. Use `-subsample 1e-5` to retain more high-frequency words.
+- **Stability**: reduce `-lr` or tighten `-grad-clip` if loss diverges. Add `-weight-decay 1e-5` if `W_proj` Frobenius norm grows unchecked across epochs.
+- **Metadata signal**: check `ft.print_projection_block_norms()` after training. If patient or provider blocks have near-zero norms, increase their dimension or lower `-chunk-size` (more frequent sync improves dense gradient accumulation).
+
+## Testing
+
+**Gradient verification:** Perturb each parameter by ε = 1e-4, measure loss change, compare to analytical gradient. Verify all groups: `input_matrix`, `ngram_matrix`, `output_matrix`, `W_proj`, `patient_matrix`, `provider_matrix`. The projection gradients are the most likely source of bugs.
+
+**Sync correctness:** Train with 1 thread and 8 threads; compare loss curves. Similar final loss confirms the reduce step is correct. If multi-threaded loss is substantially worse, decrease `-chunk-size`.
+
+**Group ablation (Python):**
+
+```python
+words_only    = ft.get_group_vector(words=["chest", "pain"])
+with_patient  = ft.get_group_vector(words=["chest", "pain"], patient_meta=["elderly", "male"])
+all_groups    = ft.get_group_vector(words=["chest", "pain"],
+                                    patient_meta=["elderly", "male"],
+                                    provider_meta=["attending"])
+```
+
+Verify that adding metadata shifts NN results in expected directions.
+
+**Projection decomposition:**
+
+```python
+ft.print_projection_block_norms()
+# W_word block should dominate; near-zero patient/provider blocks signal those groups aren't learning.
+```
+
+**Python/C++ parity:** Load the same model in both runtimes, compute combined vectors for identical inputs, verify they match to floating-point tolerance.
 
 ## File Structure
 
@@ -237,18 +362,20 @@ At inference time a `(vocab_size, dim)` cache of precomputed word vectors (word 
 .
 ├── fasttext_context.h      # Core class definition
 ├── fasttext_context.cpp    # Training orchestration & inference dispatch
-├── types.h                 # Shared structs (StreamingSample, HuffmanNode, constants)
-├── matrix.h                # Matrix class (header-only)
-├── vocabulary.h/cpp        # Vocabulary building, Huffman tree, subsampling
-├── trainer.h/cpp           # Training loop, Hogwild SGD, gradient logic
-├── inference.h/cpp         # Vector computation & nearest-neighbor search
+├── types.h                 # GroupedSample, HuffmanNode, constants
+├── matrix.h                # Matrix class with mulVec/mulVecTranspose/addOuterProduct
+├── vocabulary.h/cpp        # Three-group vocabulary (word/patient/provider)
+├── trainer.h/cpp           # Training loop, hybrid SGD, projection backward pass
+├── inference.h/cpp         # Concat+projection composition & NN search
 ├── train.cpp               # CLI: training
 ├── query.cpp               # CLI: nearest-neighbor queries
 ├── compare.cpp             # CLI: vector comparison
 ├── fasttext_context.py     # Python loader (numpy only)
-├── generate_sentences.py   # Synthetic training data generator
-├── Makefile                # Build configuration
-└── README.md               # This file
+├── generate_sentences.py   # Synthetic training data generator (triple-pipe format)
+├── Makefile
+├── mimic-iii/
+│   └── mimic-iii-preprocess.py   # MIMIC-III preprocessing → triple-pipe format
+└── README.md
 ```
 
 ## License
