@@ -51,7 +51,7 @@ PROVIDER_COLS = [
 # NLP helpers (module-level so multiprocessing workers can import them).
 # ------------------------------------------------------------------
 _DIGIT_PATTERN     = re.compile(r'\d')
-_NON_ALPHA_PATTERN = re.compile(r'[^a-z]')
+_NON_ALPHA_PATTERN = re.compile(r'[^a-z-/\\]')
 _TAG_PATTERN       = re.compile(r'\[\*\*.*?\*\*\]')
 _WHITESPACE        = re.compile(r'\s+')
 
