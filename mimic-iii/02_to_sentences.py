@@ -1,26 +1,34 @@
 """
-Step 2 of 2: NLP sentence segmentation and streaming export to training text.
+Step 2 of 3: NLP sentence segmentation → sentences parquet.
 
 Reads:
     mimic-iii-merged.parquet   (written by 01_merge.py)
 
 Writes:
-    mimic-iii-sents.txt   -- triple-pipe format for FastTextContext training
-                             <PatientGroup> ||| <ProviderGroup> ||| <sentence>
+    mimic-iii-sents.parquet   -- one row per note, columns:
+                                  SUBJECT_ID, ROW_ID,
+                                  PatientGroup, ProviderGroup,
+                                  Sentences (List[str])
+
+    PatientGroup / ProviderGroup are pre-computed context strings used by
+    03_to_text.py when writing the final training file.  Sentences have already
+    been cleaned, de-identified tag-stripped, lowercased, digit-filtered, and
+    filtered to --min-len characters, so 03_to_text.py can explode and write
+    with no further NLP work.
 
 Memory strategy:
-    The merged parquet is scanned lazily and processed in batches of --batch-size
-    rows (default 5000). Each batch is collected, NLP-processed, and its sentences
-    are written to disk before the next batch is loaded. The exploded sentence list
-    is never accumulated across batches, so peak RAM is:
-
-        ~batch_size × avg_note_size × 2  (raw text + processed sentences)
-
-    For batch_size=5000 and MIMIC-III average note length (~600 words) this is
-    roughly 50–150 MB, independent of the full dataset size.
+    The merged parquet is scanned lazily and processed in batches of
+    --batch-size rows.  Each batch is collected, NLP-processed in parallel
+    worker processes, and its result rows are written to the output parquet
+    via PyArrow's incremental ParquetWriter before the next batch is loaded.
+    Peak RAM is O(batch_size × avg_note_size).
 
 Run:
-    python3 02_to_sentences.py [--input mimic-iii-merged.parquet] [--out mimic-iii-sents.txt] [--batch-size 5000] [--workers N]
+    python3 02_to_sentences.py [--input mimic-iii-merged.parquet]
+                               [--out   mimic-iii-sents.parquet]
+                               [--batch-size 5000]
+                               [--workers N]
+                               [--min-len 20]
 """
 
 import argparse
@@ -31,6 +39,8 @@ from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
 import nltk
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
 import polars as pl
 
@@ -55,6 +65,14 @@ _NON_ALPHA_PATTERN = re.compile(r'[^a-z-/\\]')
 _TAG_PATTERN       = re.compile(r'\[\*\*.*?\*\*\]')
 _WHITESPACE        = re.compile(r'\s+')
 
+# Set by pool initializer in each worker process.
+_MIN_LEN: int = 20
+
+
+def _init_worker(min_len: int) -> None:
+    global _MIN_LEN
+    _MIN_LEN = min_len
+
 
 def _clean_text(text: str) -> str:
     if not isinstance(text, str):
@@ -75,13 +93,13 @@ def _post_process(sentences: list) -> list:
             if alpha:
                 words.append(alpha)
         result = ' '.join(words)
-        if result:
+        if result and len(result) >= _MIN_LEN:
             out.append(result)
     return out
 
 
 def process_text(text: str) -> list:
-    """Full NLP pipeline for a single note. Called in worker processes."""
+    """Full NLP pipeline for a single note.  Called in worker processes."""
     cleaned   = _clean_text(text)
     sentences = nltk.sent_tokenize(cleaned) if cleaned else []
     return _post_process(sentences)
@@ -103,54 +121,64 @@ def _group_str(row: dict, cols: list) -> str:
 
 
 # ------------------------------------------------------------------
-# Batch processor: NLP + write.
+# Output schema (fixed so PyArrow writer stays consistent across batches).
 # ------------------------------------------------------------------
-def process_and_write_batch(
-    batch: pl.DataFrame,
-    pool: Pool,
-    fp,
-    min_len: int,
-) -> int:
-    """
-    Process one batch: run NLP in parallel, write qualifying sentences to fp.
-    Returns the number of sentences written.
-    """
-    texts = batch['TEXT'].to_list()
+OUTPUT_SCHEMA = pa.schema([
+    pa.field('SUBJECT_ID',    pa.int64()),
+    pa.field('ROW_ID',        pa.int64()),
+    pa.field('PatientGroup',  pa.string()),
+    pa.field('ProviderGroup', pa.string()),
+    pa.field('Sentences',     pa.list_(pa.string())),
+])
 
-    # imap preserves order so sentence lists align with dataframe rows.
+
+def process_batch(batch: pl.DataFrame, pool: Pool) -> pa.Table:
+    """
+    Run NLP on one batch of notes.
+    Returns a PyArrow table ready to be written by ParquetWriter.
+    Notes that produce zero qualifying sentences are dropped.
+    """
+    texts          = batch['TEXT'].to_list()
     sentence_lists = list(pool.imap(process_text, texts, chunksize=256))
 
-    written = 0
-    all_cols = PATIENT_COLS + PROVIDER_COLS
+    all_cols      = PATIENT_COLS + PROVIDER_COLS
+    subject_ids   = []
+    row_ids       = []
+    patient_groups  = []
+    provider_groups = []
+    sentences_col   = []
 
-    for row_idx, sentences in enumerate(sentence_lists):
+    for i, sentences in enumerate(sentence_lists):
         if not sentences:
             continue
+        row = {col: batch[col][i] for col in all_cols}
+        subject_ids.append(batch['SUBJECT_ID'][i])
+        row_ids.append(batch['ROW_ID'][i])
+        patient_groups.append(_group_str(row, PATIENT_COLS))
+        provider_groups.append(_group_str(row, PROVIDER_COLS))
+        sentences_col.append(sentences)
 
-        # Build context strings once per note, not once per sentence.
-        row = {col: batch[col][row_idx] for col in all_cols}
-        patient_str  = _group_str(row, PATIENT_COLS)
-        provider_str = _group_str(row, PROVIDER_COLS)
-        prefix       = f"{patient_str} ||| {provider_str} ||| "
-
-        for sent in sentences:
-            if len(sent) < min_len:
-                continue
-            fp.write(prefix + sent + '\n')
-            written += 1
-
-    return written
+    return pa.table(
+        {
+            'SUBJECT_ID':    pa.array(subject_ids,    type=pa.int64()),
+            'ROW_ID':        pa.array(row_ids,        type=pa.int64()),
+            'PatientGroup':  pa.array(patient_groups, type=pa.string()),
+            'ProviderGroup': pa.array(provider_groups, type=pa.string()),
+            'Sentences':     pa.array(sentences_col,  type=pa.list_(pa.string())),
+        },
+        schema=OUTPUT_SCHEMA,
+    )
 
 
 # ------------------------------------------------------------------
 # Main.
 # ------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description='MIMIC-III step 2: NLP sentence export.')
+    parser = argparse.ArgumentParser(description='MIMIC-III step 2: NLP sentence segmentation.')
     parser.add_argument('--input',      default='mimic-iii-merged.parquet',
                         help='Merged parquet from 01_merge.py (default: mimic-iii-merged.parquet)')
-    parser.add_argument('--out',        default='mimic-iii-sents.txt',
-                        help='Output training text file (default: mimic-iii-sents.txt)')
+    parser.add_argument('--out',        default='mimic-iii-sents.parquet',
+                        help='Output sentences parquet (default: mimic-iii-sents.parquet)')
     parser.add_argument('--batch-size', type=int, default=5_000,
                         help='Notes per batch (default: 5000). Lower = less RAM, more overhead.')
     parser.add_argument('--workers',    type=int, default=max(1, cpu_count() - 1),
@@ -164,11 +192,10 @@ def main():
         print("Run 01_merge.py first.", file=sys.stderr)
         sys.exit(1)
 
-    # Count total rows cheaply without loading the data.
-    total_rows = pl.scan_parquet(args.input).select(pl.len()).collect().item()
+    total_rows    = pl.scan_parquet(args.input).select(pl.len()).collect().item()
     total_batches = (total_rows + args.batch_size - 1) // args.batch_size
 
-    print("=== MIMIC-III Step 2: NLP + Export ===")
+    print("=== MIMIC-III Step 2: Sentence Segmentation ===")
     print(f"  Input      : {args.input}")
     print(f"  Output     : {args.out}")
     print(f"  Total rows : {total_rows:,}")
@@ -177,33 +204,44 @@ def main():
     print(f"  Min sent.  : {args.min_len} chars")
     print()
 
-    lf = pl.scan_parquet(args.input)
-    t0 = time.time()
-    total_written = 0
+    lf           = pl.scan_parquet(args.input)
+    writer       = None
+    total_notes  = 0
+    total_sents  = 0
+    t0           = time.time()
 
-    # One Pool created here and reused across all batches — avoids repeated
-    # process startup overhead which would dominate for small batch sizes.
-    with Pool(processes=args.workers) as pool, \
-         open(args.out, 'w', encoding='utf-8') as fp:
+    with Pool(processes=args.workers,
+              initializer=_init_worker,
+              initargs=(args.min_len,)) as pool:
 
         for batch_idx in tqdm(range(total_batches), desc='Batches', unit='batch'):
             offset = batch_idx * args.batch_size
+            batch  = lf.slice(offset, args.batch_size).collect()
 
-            # Collect only this slice — peak RAM is O(batch_size).
-            batch = lf.slice(offset, args.batch_size).collect()
-
-            written = process_and_write_batch(batch, pool, fp, args.min_len)
-            total_written += written
-
-            # Explicitly delete batch to release RAM before the next slice.
+            result = process_batch(batch, pool)
             del batch
 
+            if result.num_rows == 0:
+                continue
+
+            total_notes += result.num_rows
+            total_sents += sum(len(s) for s in result['Sentences'].to_pylist())
+
+            if writer is None:
+                writer = pq.ParquetWriter(args.out, OUTPUT_SCHEMA, compression='zstd')
+            writer.write_table(result)
+
+    if writer:
+        writer.close()
+
     elapsed = time.time() - t0
-    out_mb  = Path(args.out).stat().st_size / 1_048_576
+    out_mb  = Path(args.out).stat().st_size / 1_048_576 if Path(args.out).exists() else 0
 
     print(f"\nDone in {elapsed:.1f}s")
-    print(f"  Sentences written : {total_written:,}")
-    print(f"  Output file       : {args.out}  ({out_mb:.1f} MB)")
+    print(f"  Notes with sentences : {total_notes:,}")
+    print(f"  Total sentences      : {total_sents:,}")
+    print(f"  Output file          : {args.out}  ({out_mb:.1f} MB)")
+    print("Run 03_to_text.py next to generate the training text file.")
 
 
 if __name__ == '__main__':

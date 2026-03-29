@@ -116,7 +116,7 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     ])
 
     # Keep only the columns the next script needs.
-    return notes.select(all_meta_cols + ['TEXT'])
+    return notes.select(['SUBJECT_ID', 'ROW_ID'] + all_meta_cols + ['TEXT'])
 
 
 def main():
@@ -161,7 +161,7 @@ def main():
     size_mb = Path(out_path).stat().st_size / 1_048_576
 
     print(f"\nDone in {elapsed:.1f}s  →  {out_path}  ({size_mb:.1f} MB)")
-    print("Run 02_to_sentences.py next.")
+    print("Run 02_to_sentences.py next to segment notes into sentences.")
 
 
 if __name__ == '__main__':
