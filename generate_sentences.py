@@ -2,89 +2,120 @@ import random
 import os
 
 # Configuration
-authors = ["alice", "bob", "charlie", "diana", "eve", "frank", "grace", "john"]
-domains = ["tech", "finance", "health", "politics", "science", "sports", "arts"]
-years = [2020, 2021, 2022, 2023, 2024]
-sentiments = ["positive", "neutral", "negative"]
-locations = ["NYC", "London", "Tokyo", "Berlin", "Paris", "Sydney"]
+ages = ["infant", "child", "adolescent", "young_adult", "adult", "middle_aged", "aged", "elderly"]
+genders = ["male", "female"]
+ethnicities = ["white", "black", "hispanic", "asian", "other"]
+languages = ["english", "spanish", "portuguese", "mandarin", "other"]
+religions = ["christian", "jewish", "muslim", "buddhist", "other", "none"]
+marital_statuses = ["single", "married", "divorced", "widowed"]
+insurances = ["medicare", "medicaid", "private", "self_pay", "government"]
 
-# Sentence templates to ensure variety
+caregiver_titles = [
+    "attending", "resident_physician", "fellow", "nurse", "nurse_practitioner",
+    "physician_assistant", "social_worker", "physical_therapist"
+]
+admission_types = ["emergency", "elective", "urgent", "newborn"]
+
+# Sentence templates
 templates = [
-    "The {topic} market is showing {trend} signs today.",
-    "{author} argues that {technology} will change the future of {industry}.",
-    "Recent studies in {location} suggest a {trend} in {topic} adoption.",
-    "The {event} highlighted the importance of {topic} in modern {industry}.",
-    "Experts predict a {trend} shift in {topic} by {year}.",
-    "New regulations in {location} affect how {topic} is managed.",
-    "The {sentiment} response to the {event} was unexpected.",
-    "Data from {year} shows a clear {trend} in {topic} metrics.",
-    "{author} believes that {technology} is the key to solving {problem}.",
-    "The intersection of {topic} and {industry} is creating new opportunities.",
-    "Critics argue that the current {topic} strategy is {sentiment}.",
-    "In {location}, the {topic} sector is experiencing rapid growth.",
-    "The report released by {author} details the {trend} of {topic}.",
-    "Advances in {technology} are driving changes in {industry}.",
-    "Public opinion on {topic} has shifted {sentiment} since {year}.",
-    "The {event} served as a turning point for {topic} enthusiasts.",
-    "Analysts warn of potential risks in the {topic} market.",
-    "Innovation in {technology} is reshaping the landscape of {industry}.",
-    "The debate over {topic} continues to divide experts in {location}.",
-    "A new study reveals {trend} patterns in {topic} consumption.",
+    "The patient was admitted with {complaint} and required immediate evaluation.",
+    "Physical examination revealed {finding} consistent with {diagnosis}.",
+    "The patient reported {symptom} for the past {duration}.",
+    "Laboratory results showed {lab_finding} suggesting {diagnosis}.",
+    "The patient was started on {treatment} with good response.",
+    "Follow-up imaging demonstrated {finding} compared to prior studies.",
+    "The patient was discharged in stable condition after {treatment}.",
+    "Vital signs were stable with {vital} within normal limits.",
+    "The patient denied {symptom} at the time of evaluation.",
+    "Family history was significant for {condition}.",
+    "The patient has a history of {condition} managed with {treatment}.",
+    "Neurological examination was intact without focal {finding}.",
+    "Cardiovascular examination revealed {finding} on auscultation.",
+    "The patient was counseled on {topic} prior to discharge.",
+    "Surgical pathology confirmed {diagnosis} with clear margins.",
+    "Chronic {condition} was noted on review of prior records.",
+    "The patient responded well to {treatment} over the course of admission.",
+    "An echocardiogram was obtained showing {finding}.",
+    "The patient was evaluated by {specialist} for further management.",
+    "Social work was consulted to address {topic} prior to discharge.",
 ]
 
-topics = ["AI", "crypto", "renewable energy", "quantum computing", "biotech", "blockchain", "cloud", "cybersecurity"]
-technologies = ["neural networks", "smart contracts", "CRISPR", "5G", "IoT", "edge computing", "LLMs"]
-industries = ["healthcare", "banking", "retail", "manufacturing", "education", "logistics"]
-events = ["summit", "conference", "election", "crisis", "launch", "report"]
-problems = ["climate change", "inequality", "security breaches", "data privacy", "efficiency"]
-trends = ["upward", "downward", "volatile", "stable", "exponential", "linear"]
+complaints   = ["chest pain", "shortness of breath", "abdominal pain", "altered mental status",
+                 "fever", "syncope", "weakness", "headache", "back pain", "falls"]
+findings     = ["cardiomegaly", "consolidation", "effusion", "atelectasis", "normal sinus rhythm",
+                "ST changes", "focal deficits", "murmur", "tenderness", "organomegaly"]
+diagnoses    = ["pneumonia", "heart failure", "sepsis", "COPD exacerbation", "acute MI",
+                "pulmonary embolism", "urinary tract infection", "cellulitis", "anemia",
+                "dehydration"]
+symptoms     = ["dyspnea", "nausea", "vomiting", "diarrhea", "fatigue", "chest tightness",
+                "palpitations", "dizziness", "diaphoresis", "lower extremity edema"]
+durations    = ["two days", "one week", "three days", "several hours", "one month"]
+treatments   = ["antibiotics", "diuretics", "anticoagulation", "supplemental oxygen",
+                "IV fluids", "vasopressors", "bronchodilators", "insulin", "analgesics",
+                "steroids"]
+vitals       = ["blood pressure", "heart rate", "oxygen saturation", "temperature",
+                "respiratory rate"]
+conditions   = ["hypertension", "diabetes mellitus", "coronary artery disease", "COPD",
+                "chronic kidney disease", "atrial fibrillation", "heart failure",
+                "hypothyroidism", "obesity", "depression"]
+topics       = ["fall precautions", "medication compliance", "diet modifications",
+                "follow-up appointments", "wound care", "smoking cessation",
+                "activity restrictions"]
+specialists  = ["cardiology", "pulmonology", "nephrology", "neurology", "gastroenterology",
+                "infectious disease", "hematology", "endocrinology"]
+lab_findings = ["elevated troponin", "leukocytosis", "anemia", "hyponatremia",
+                "elevated creatinine", "elevated lactate", "thrombocytopenia",
+                "hypokalemia", "coagulopathy"]
 
-def generate_training_file(filename="training_data_with_context.txt", num_rows=1_000_000):
 
+def generate_training_file(filename: str = "training_data_with_context.txt",
+                            num_rows: int = 1_000_000) -> None:
     with open(filename, "w", encoding="utf-8") as f:
-        for i in range(num_rows):
-            # Select random metadata
-            author = random.choice(authors)
-            domain = random.choice(domains)
-            year = random.choice(years)
-            sentiment = random.choice(sentiments)
-            location = random.choice(locations)
-            
-            # Select random sentence components
+        for _ in range(num_rows):
+            # Patient group fields (may be empty).
+            n_patient = random.randint(0, 5)
+            all_patient_fields = [
+                random.choice(ages),
+                random.choice(genders),
+                random.choice(ethnicities),
+                random.choice(languages),
+                random.choice(marital_statuses),
+                random.choice(insurances),
+            ]
+            patient_fields = random.sample(all_patient_fields, min(n_patient, len(all_patient_fields)))
+            patient_str = " ".join(patient_fields)
+
+            # Provider group fields (may be empty).
+            n_provider = random.randint(0, 2)
+            all_provider_fields = [
+                random.choice(caregiver_titles),
+                random.choice(admission_types),
+            ]
+            provider_fields = random.sample(all_provider_fields, min(n_provider, len(all_provider_fields)))
+            provider_str = " ".join(provider_fields)
+
+            # Sentence from template.
             template = random.choice(templates)
-            topic = random.choice(topics)
-            tech = random.choice(technologies)
-            industry = random.choice(industries)
-            event = random.choice(events)
-            problem = random.choice(problems)
-            trend = random.choice(trends)
-            
-            # Fill template
             sentence = template.format(
-                author=author.capitalize(),
-                domain=domain,
-                year=year,
-                sentiment=sentiment,
-                location=location,
-                topic=topic,
-                technology=tech,
-                industry=industry,
-                event=event,
-                problem=problem,
-                trend=trend
+                complaint=random.choice(complaints),
+                finding=random.choice(findings),
+                diagnosis=random.choice(diagnoses),
+                symptom=random.choice(symptoms),
+                duration=random.choice(durations),
+                treatment=random.choice(treatments),
+                vital=random.choice(vitals),
+                condition=random.choice(conditions),
+                topic=random.choice(topics),
+                specialist=random.choice(specialists),
+                lab_finding=random.choice(lab_findings),
             )
-            
-            # Construct the row: context1|||context2|||sentence
-            n = random.randint(0, 3)
-            elements = random.sample([author, year, location], n)
-            ctx1 = " ".join(map(str, elements))
-            n = random.randint(0, 2)
-            elements = random.sample([domain, sentiment], n)
-            ctx2 = " ".join(map(str, elements))
-            row = " ||| ".join([ctx1, ctx2, sentence])
+
+            # Format: <PatientGroup> ||| <ProviderGroup> ||| <Words>
+            row = f"{patient_str} ||| {provider_str} ||| {sentence}"
             f.write(row + "\n")
 
     print(f"Generated {num_rows} rows in '{filename}'")
+
 
 if __name__ == "__main__":
     generate_training_file()

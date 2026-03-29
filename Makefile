@@ -12,7 +12,7 @@ SRC_TRAIN = train.cpp
 SRC_QUERY = query.cpp
 SRC_COMPARE = compare.cpp
 
-HEADER = fasttext_context.h
+HEADER = fasttext_context.h inference.h trainer.h vocabulary.h matrix.h types.h
 
 .PHONY: all clean
 

@@ -8,20 +8,25 @@
 #include <chrono>
 #include <omp.h>
 #include <limits>
+#include <cstring>
 
 namespace fasttext {
 
-Trainer::Trainer(int dim, int epoch, float lr, int min_n, int max_n,
-                 int chunk_size, int ngram_buckets, int window_size, float grad_clip)
-    : dim_(dim), epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
-      chunk_size_(chunk_size), ngram_buckets_(ngram_buckets), window_size_(window_size),
-      grad_clip_(grad_clip) {
+Trainer::Trainer(int d_w, int d_p, int d_pr, int d_out,
+                 int epoch, float lr, int min_n, int max_n,
+                 int chunk_size, int ngram_buckets, int window_size,
+                 float grad_clip, float weight_decay)
+    : d_w_(d_w), d_p_(d_p), d_pr_(d_pr), d_out_(d_out),
+      concat_dim_(d_w + d_p + d_pr),
+      epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
+      chunk_size_(chunk_size), ngram_buckets_(ngram_buckets),
+      window_size_(window_size), grad_clip_(grad_clip), weight_decay_(weight_decay) {
     int T = omp_get_max_threads();
     rngs_.resize(T);
     for (int i = 0; i < T; ++i) rngs_[i].seed(std::random_device{}() + i);
 
     thread_bufs_.resize(T);
-    for (auto& buf : thread_bufs_) buf.resize(dim);
+    for (auto& buf : thread_bufs_) buf.resize(d_w, d_p, d_pr, d_out);
 }
 
 void Trainer::clipNorm(std::vector<float>& v, float max_norm) {
@@ -49,23 +54,44 @@ void Trainer::getNgramIndices(const std::string& word, std::vector<int>& out) co
     }
 }
 
-bool Trainer::parseLine(const std::string& line, StreamingSample& sample) const {
-    sample.metadata_fields.clear();
+bool Trainer::parseGroupedLine(const std::string& line, GroupedSample& sample) const {
+    sample.patient_fields.clear();
+    sample.provider_fields.clear();
     sample.words.clear();
+
     if (line.empty()) return false;
 
-    std::stringstream ss(line);
-    std::string field;
-    std::vector<std::string> fields;
-    while (std::getline(ss, field, '|')) fields.push_back(field);
-    if (fields.empty()) return false;
+    // Split on " ||| " (space-pipe-pipe-pipe-space).
+    // Expect exactly 3 groups: patient, provider, words.
+    std::vector<std::string> groups;
+    size_t start = 0;
+    const std::string delim = " ||| ";
+    while (true) {
+        size_t pos = line.find(delim, start);
+        if (pos == std::string::npos) {
+            groups.push_back(line.substr(start));
+            break;
+        }
+        groups.push_back(line.substr(start, pos - start));
+        start = pos + delim.size();
+    }
 
-    for (size_t i = 0; i + 1 < fields.size(); ++i)
-        sample.metadata_fields.push_back(fields[i]);
+    if (groups.size() != 3) return false;
 
-    std::istringstream sent(fields.back());
-    std::string word;
-    while (sent >> word) sample.words.push_back(word);
+    std::string token;
+
+    // Patient group (index 0).
+    std::istringstream ps(groups[0]);
+    while (ps >> token) sample.patient_fields.push_back(token);
+
+    // Provider group (index 1).
+    std::istringstream prs(groups[1]);
+    while (prs >> token) sample.provider_fields.push_back(token);
+
+    // Words group (index 2, always last).
+    std::istringstream ws(groups[2]);
+    while (ws >> token) sample.words.push_back(token);
+
     return !sample.words.empty();
 }
 
@@ -100,55 +126,100 @@ bool Trainer::checkMatrixHealth(const Matrix& m, const std::string& name, int ep
     return true;
 }
 
-void Trainer::computeGate(const float* word_part,
-                           const std::vector<float>& gate_bias,
-                           std::vector<float>& gate) const {
-    for (int j = 0; j < dim_; ++j) {
-        float x = gate_bias[j] + word_part[j];
-        // Clamp to avoid overflow in exp.
-        x = std::max(-20.0f, std::min(20.0f, x));
-        gate[j] = 1.0f / (1.0f + std::exp(-x));
+void Trainer::broadcastDenseParams(const Matrix& W_proj,
+                                   const Matrix& patient_matrix,
+                                   const Matrix& provider_matrix) {
+    int T = omp_get_max_threads();
+    for (int t = 0; t < T; ++t) {
+        std::memcpy(W_proj_local_[t].data(), W_proj.data(),
+                    static_cast<size_t>(W_proj.size()) * sizeof(float));
+        std::memcpy(patient_local_[t].data(), patient_matrix.data(),
+                    static_cast<size_t>(patient_matrix.size()) * sizeof(float));
+        std::memcpy(provider_local_[t].data(), provider_matrix.data(),
+                    static_cast<size_t>(provider_matrix.size()) * sizeof(float));
     }
 }
 
-std::vector<int> Trainer::gatherGatedMetaVec(const StreamingSample& sample,
-                                              const Vocabulary& vocab,
-                                              const Matrix& metadata_matrix,
-                                              const std::vector<float>& alpha,
-                                              const std::vector<float>& gate,
-                                              std::vector<float>& out_meta_vec) const {
-    std::fill(out_meta_vec.begin(), out_meta_vec.begin() + dim_, 0.0f);
-    std::vector<int> active;
+void Trainer::reduceDenseParams(Matrix& W_proj,
+                                Matrix& patient_matrix,
+                                Matrix& provider_matrix) {
+    int T = omp_get_max_threads();
+    float inv_T = 1.0f / static_cast<float>(T);
 
-    for (const auto& meta : sample.metadata_fields) {
-        int idx = vocab.getMetadataIdx(meta);
-        if (idx < 0) continue;
-        const float* row = metadata_matrix.row(idx);
-        float a = alpha[idx];
-        for (int j = 0; j < dim_; ++j)
-            out_meta_vec[j] += a * gate[j] * row[j];
-        active.push_back(idx);
+    auto average = [&](Matrix& shared, std::vector<Matrix>& locals) {
+        for (int64_t i = 0; i < shared.size(); ++i) {
+            float sum = 0.0f;
+            for (int t = 0; t < T; ++t)
+                sum += locals[t].data()[i];
+            shared.data()[i] = sum * inv_T;
+        }
+    };
+
+    average(W_proj, W_proj_local_);
+    average(patient_matrix, patient_local_);
+    average(provider_matrix, provider_local_);
+
+    // L2 weight decay on W_proj only (not on embedding matrices).
+    // Applied after each chunk reduce: W_proj *= (1 - weight_decay).
+    // Prevents the projection from memorizing low-cardinality metadata patterns.
+    if (weight_decay_ > 0.0f) {
+        const float scale = 1.0f - weight_decay_;
+        for (int64_t i = 0; i < W_proj.size(); ++i)
+            W_proj.data()[i] *= scale;
     }
-    return active;
 }
 
-void Trainer::buildCenterVec(int word_idx, const std::string& word,
-                              const Matrix& input_matrix, const Matrix& ngram_matrix,
-                              const std::vector<float>& meta_vec,
-                              std::vector<float>& out_vec,
-                              std::vector<int>& out_ngram) const {
-    std::fill(out_vec.begin(), out_vec.begin() + dim_, 0.0f);
+void Trainer::buildConcatVec(int word_idx, const std::string& word,
+                              const GroupedSample& sample,
+                              const Vocabulary& vocab,
+                              const Matrix& input_matrix,
+                              const Matrix& ngram_matrix,
+                              const Matrix& patient_matrix,
+                              const Matrix& provider_matrix,
+                              std::vector<float>& concat_out,
+                              std::vector<int>& ngram_out) const {
+    std::fill(concat_out.begin(), concat_out.end(), 0.0f);
 
+    // Word part: concat_out[0..d_w).
+    float* wp = concat_out.data();
     const float* wr = input_matrix.row(word_idx);
-    for (int j = 0; j < dim_; ++j) out_vec[j] += wr[j];
+    for (int j = 0; j < d_w_; ++j) wp[j] += wr[j];
 
-    getNgramIndices(word, out_ngram);
-    for (int idx : out_ngram) {
+    getNgramIndices(word, ngram_out);
+    for (int idx : ngram_out) {
         const float* nr = ngram_matrix.row(idx);
-        for (int j = 0; j < dim_; ++j) out_vec[j] += nr[j];
+        for (int j = 0; j < d_w_; ++j) wp[j] += nr[j];
     }
 
-    for (int j = 0; j < dim_; ++j) out_vec[j] += meta_vec[j];
+    // Patient part: concat_out[d_w..d_w+d_p).
+    float* pp = concat_out.data() + d_w_;
+    int n_patient = 0;
+    for (const auto& field : sample.patient_fields) {
+        int idx = vocab.getPatientIdx(field);
+        if (idx < 0) continue;
+        const float* pr = patient_matrix.row(idx);
+        for (int j = 0; j < d_p_; ++j) pp[j] += pr[j];
+        ++n_patient;
+    }
+    if (n_patient > 1) {
+        float inv = 1.0f / static_cast<float>(n_patient);
+        for (int j = 0; j < d_p_; ++j) pp[j] *= inv;
+    }
+
+    // Provider part: concat_out[d_w+d_p..concat_dim).
+    float* prp = concat_out.data() + d_w_ + d_p_;
+    int n_provider = 0;
+    for (const auto& field : sample.provider_fields) {
+        int idx = vocab.getProviderIdx(field);
+        if (idx < 0) continue;
+        const float* pr = provider_matrix.row(idx);
+        for (int j = 0; j < d_pr_; ++j) prp[j] += pr[j];
+        ++n_provider;
+    }
+    if (n_provider > 1) {
+        float inv = 1.0f / static_cast<float>(n_provider);
+        for (int j = 0; j < d_pr_; ++j) prp[j] *= inv;
+    }
 }
 
 float Trainer::hsStep(int node_idx, int direction,
@@ -160,111 +231,113 @@ float Trainer::hsStep(int node_idx, int direction,
     const float* out_row = output_matrix.row(node_idx);
 
     float dot = 0.0f;
-    for (int j = 0; j < dim_; ++j) dot += out_row[j] * center_vec[j];
+    for (int j = 0; j < d_out_; ++j) dot += out_row[j] * center_vec[j];
     dot = std::max(-20.0f, std::min(20.0f, dot));
 
     const float sig    = 1.0f / (1.0f + std::exp(-dot));
     const float target = (direction == 0) ? 1.0f : 0.0f;
     const float g      = lr * (target - sig);
 
-    for (int j = 0; j < dim_; ++j) center_grad[j] += g * out_row[j];
+    for (int j = 0; j < d_out_; ++j) center_grad[j] += g * out_row[j];
 
-    for (int j = 0; j < dim_; ++j) scratch[j] = g * center_vec[j];
+    // Clip output node update before applying (Hogwild).
+    for (int j = 0; j < d_out_; ++j) scratch[j] = g * center_vec[j];
     clipNorm(scratch, grad_clip_);
 
     float* mut_row = output_matrix.row(node_idx);
-    for (int j = 0; j < dim_; ++j) mut_row[j] += scratch[j];
+    for (int j = 0; j < d_out_; ++j) mut_row[j] += scratch[j];
 
     const float p = std::max(1e-7f, std::min(1.0f - 1e-7f, sig));
     return -(target * std::log(p) + (1.0f - target) * std::log(1.0f - p));
 }
 
-// Distributes gradients for gated composition:
+// Backward pass through the linear projection.
 //
-// center_grad flows back through:
-//   (a) word_emb: direct gradient + gate-path gradient
-//   (b) ngram embeddings: direct gradient + gate-path gradient
-//       (ngrams now contribute to the gate signal via word_part, so they share
-//        the same gate-path gradient as word_emb)
-//   (c) meta_emb_k: grad_j = center_grad_j * alpha_k * gate_j
-//   (d) alpha_k: sum_j(center_grad_j * gate_j * meta_emb_k_j)
-//   (e) gate_bias g:
-//       S_j = sum_k(alpha_k * meta_emb_k_j)
-//       gate_grad_j = center_grad_j * S_j * gate_j * (1 - gate_j)
-//       word_emb_j, every ngram_emb_j, and g_j all receive += gate_grad_j
-void Trainer::distributeGrad(const std::vector<float>& center_grad,
+// Given:
+//   center_vec = W_proj * concat_vec   (forward pass)
+//   center_grad ∈ R^d_out              (accumulated from HS, already clipped)
+//
+// Computes:
+//   concat_grad = W_proj^T * center_grad        [step 6a]
+//   W_proj     += lr * center_grad * concat^T   [step 6b, thread-local]
+//
+// Then distributes concat_grad slices:
+//   word_grad     = concat_grad[0..d_w)          → input_matrix, ngram_matrix (Hogwild)
+//   patient_grad  = concat_grad[d_w..d_w+d_p)    → patient_matrix (thread-local)
+//   provider_grad = concat_grad[d_w+d_p..end)     → provider_matrix (thread-local)
+void Trainer::distributeGrad(const std::vector<float>& concat_grad,
+                              const std::vector<float>& center_grad,
+                              const std::vector<float>& concat_vec,
                               int word_idx,
                               const std::vector<int>& ngram_indices,
-                              const std::vector<int>& active_meta,
-                              const std::vector<float>& gate,
-                              const std::vector<float>& alpha,
-                              const Matrix& metadata_matrix,
+                              const GroupedSample& sample,
+                              const Vocabulary& vocab,
                               Matrix& input_matrix,
                               Matrix& ngram_matrix,
-                              Matrix& metadata_matrix_mutable,
-                              std::vector<float>& gate_bias,
-                              std::vector<float>& alpha_mutable,
-                              std::vector<float>& gate_bias_grad_buf,
+                              Matrix& W_proj,
+                              Matrix& patient_matrix,
+                              Matrix& provider_matrix,
                               float lr) {
-    // Compute S_j = sum_k(alpha_k * meta_emb_k_j) for gate gradient.
-    std::fill(gate_bias_grad_buf.begin(), gate_bias_grad_buf.begin() + dim_, 0.0f);
-    for (int k : active_meta) {
-        const float* mr = metadata_matrix.row(k);
-        float a = alpha[k];
-        for (int j = 0; j < dim_; ++j)
-            gate_bias_grad_buf[j] += a * mr[j];
-    }
-    // gate_bias_grad_buf now holds S_j.
-    // Multiply by center_grad_j * gate_j * (1 - gate_j) to get gate path gradient.
-    for (int j = 0; j < dim_; ++j)
-        gate_bias_grad_buf[j] *= center_grad[j] * gate[j] * (1.0f - gate[j]);
+    // Update W_proj (thread-local): W_proj += lr * center_grad * concat^T.
+    W_proj.addOuterProduct(center_grad.data(), concat_vec.data(), lr);
 
-    // (a) word_emb: direct gradient + gate-path gradient (Hogwild).
+    // Word part [0..d_w): Hogwild writes to shared input/ngram matrices.
+    const float* word_grad = concat_grad.data();
+
     float* wr = input_matrix.row(word_idx);
-    for (int j = 0; j < dim_; ++j)
-        wr[j] += center_grad[j] + gate_bias_grad_buf[j];
+    for (int j = 0; j < d_w_; ++j)
+        wr[j] += lr * word_grad[j];
 
-    // (b) ngram embeddings: direct gradient + gate-path gradient.
-    // Ngrams now contribute to the gate signal (via word_part), so they receive
-    // the same gate-path gradient as word_emb.
     for (int idx : ngram_indices) {
         float* nr = ngram_matrix.row(idx);
-        for (int j = 0; j < dim_; ++j)
-            nr[j] += center_grad[j] + gate_bias_grad_buf[j];
+        for (int j = 0; j < d_w_; ++j)
+            nr[j] += lr * word_grad[j];
     }
 
-    // (c) + (d) metadata rows and alpha scalars.
-    for (int k : active_meta) {
-        const float* mr_const = metadata_matrix.row(k);
-        float* mr = metadata_matrix_mutable.row(k);
-        float a = alpha[k];
+    // Patient part [d_w..d_w+d_p): write to thread-local patient_matrix.
+    const float* patient_grad = concat_grad.data() + d_w_;
+    int n_patient = 0;
+    for (const auto& field : sample.patient_fields)
+        if (vocab.getPatientIdx(field) >= 0) ++n_patient;
 
-        // Alpha gradient: sum_j(center_grad_j * gate_j * meta_emb_k_j).
-        float alpha_grad = 0.0f;
-        for (int j = 0; j < dim_; ++j)
-            alpha_grad += center_grad[j] * gate[j] * mr_const[j];
-
-        // Clamp alpha gradient by grad_clip_ (scalar version).
-        if (grad_clip_ > 0.0f)
-            alpha_grad = std::max(-grad_clip_, std::min(grad_clip_, alpha_grad));
-        alpha_mutable[k] += alpha_grad;
-
-        // Meta embedding gradient: center_grad_j * alpha_k * gate_j.
-        for (int j = 0; j < dim_; ++j)
-            mr[j] += center_grad[j] * a * gate[j];
+    if (n_patient > 0) {
+        float patient_scale = lr / static_cast<float>(n_patient);
+        for (const auto& field : sample.patient_fields) {
+            int idx = vocab.getPatientIdx(field);
+            if (idx < 0) continue;
+            float* pr = patient_matrix.row(idx);
+            for (int j = 0; j < d_p_; ++j)
+                pr[j] += patient_scale * patient_grad[j];
+        }
     }
 
-    // (e) gate_bias: same gradient as word_emb gate-path (Hogwild).
-    for (int j = 0; j < dim_; ++j)
-        gate_bias[j] += gate_bias_grad_buf[j];
+    // Provider part [d_w+d_p..concat_dim): write to thread-local provider_matrix.
+    const float* provider_grad = concat_grad.data() + d_w_ + d_p_;
+    int n_provider = 0;
+    for (const auto& field : sample.provider_fields)
+        if (vocab.getProviderIdx(field) >= 0) ++n_provider;
+
+    if (n_provider > 0) {
+        float provider_scale = lr / static_cast<float>(n_provider);
+        for (const auto& field : sample.provider_fields) {
+            int idx = vocab.getProviderIdx(field);
+            if (idx < 0) continue;
+            float* pr = provider_matrix.row(idx);
+            for (int j = 0; j < d_pr_; ++j)
+                pr[j] += provider_scale * provider_grad[j];
+        }
+    }
 }
 
-void Trainer::processSample(const StreamingSample& sample, const Vocabulary& vocab,
-                             Matrix& input_matrix, Matrix& output_matrix,
-                             Matrix& ngram_matrix, Matrix& metadata_matrix,
-                             std::vector<float>& gate_bias, std::vector<float>& alpha,
-                             float lr, int tid,
-                             double& loss_acc, int& pred_count) {
+void Trainer::processSample(const GroupedSample& sample,
+                            const Vocabulary& vocab,
+                            Matrix& input_matrix, Matrix& output_matrix,
+                            Matrix& ngram_matrix,
+                            Matrix& W_proj,
+                            Matrix& patient_matrix,
+                            Matrix& provider_matrix,
+                            float lr, int tid,
+                            double& loss_acc, int& pred_count) {
     std::uniform_real_distribution<float> ud(0.0f, 1.0f);
     auto& buf = thread_bufs_[tid];
 
@@ -272,35 +345,24 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
         const int cw_idx = vocab.getWordIdx(sample.words[cp]);
         if (cw_idx < 0) continue;
 
+        // Subsampling.
         if (!vocab.discard_probs_.empty() && vocab.discard_probs_[cw_idx] > 0.0f)
             if (ud(rngs_[tid]) < vocab.discard_probs_[cw_idx]) continue;
 
-        // Build word_part = word_emb + sum(ngrams) into buf.word_part.
-        // This is done before meta is added so the gate has a clean signal.
-        std::fill(buf.word_part.begin(), buf.word_part.begin() + dim_, 0.0f);
-        const float* wr = input_matrix.row(cw_idx);
-        for (int j = 0; j < dim_; ++j) buf.word_part[j] += wr[j];
-        getNgramIndices(sample.words[cp], buf.ngram_indices);
-        for (int idx : buf.ngram_indices) {
-            const float* nr = ngram_matrix.row(idx);
-            for (int j = 0; j < dim_; ++j) buf.word_part[j] += nr[j];
-        }
+        // 1. Build concat_vec = [word_part ; patient_avg ; provider_avg].
+        buildConcatVec(cw_idx, sample.words[cp], sample, vocab,
+                       input_matrix, ngram_matrix,
+                       patient_matrix, provider_matrix,
+                       buf.concat_vec, buf.ngram_indices);
 
-        // Compute gate from word_part (covers OOV words via ngrams).
-        computeGate(buf.word_part.data(), gate_bias, buf.gate);
+        // 2. Project to d_out: center_vec = W_proj * concat_vec.
+        W_proj.mulVec(buf.concat_vec.data(), buf.center_vec.data());
 
-        // Gather gated metadata vector (per-center-word, because gate depends on word_part).
-        std::vector<int> active_meta = gatherGatedMetaVec(
-            sample, vocab, metadata_matrix, alpha, buf.gate, buf.meta_vec);
+        // 3. Zero center_grad accumulator.
+        std::fill(buf.center_grad.begin(), buf.center_grad.end(), 0.0f);
 
-        // Final center_vec = word_part + gated_meta.
-        for (int j = 0; j < dim_; ++j)
-            buf.center_vec[j] = buf.word_part[j] + buf.meta_vec[j];
-
-        // Zero gradient accumulator.
-        std::fill(buf.center_grad.begin(), buf.center_grad.begin() + dim_, 0.0f);
-
-        const int win   = 1 + static_cast<int>(rngs_[tid]() % window_size_);
+        // 4. Skip-gram hierarchical softmax loop.
+        const int win    = 1 + static_cast<int>(rngs_[tid]() % window_size_);
         const int wstart = std::max(0, cp - win);
         const int wend   = std::min(static_cast<int>(sample.words.size()), cp + win + 1);
 
@@ -326,37 +388,55 @@ void Trainer::processSample(const StreamingSample& sample, const Vocabulary& voc
             }
         }
 
-        // Clip accumulated center gradient before distribution.
+        // 5. Clip accumulated center_grad before backpropagation through projection.
         clipNorm(buf.center_grad, grad_clip_);
 
-        distributeGrad(buf.center_grad, cw_idx, buf.ngram_indices, active_meta,
-                       buf.gate, alpha, metadata_matrix,
-                       input_matrix, ngram_matrix, metadata_matrix,
-                       gate_bias, alpha,
-                       buf.gate_bias_grad, lr);
+        // 6a. concat_grad = W_proj^T * center_grad.
+        W_proj.mulVecTranspose(buf.center_grad.data(), buf.concat_grad.data());
+
+        // 6b + 7. Update W_proj (thread-local) and distribute concat_grad slices.
+        distributeGrad(buf.concat_grad, buf.center_grad, buf.concat_vec,
+                       cw_idx, buf.ngram_indices, sample, vocab,
+                       input_matrix, ngram_matrix,
+                       W_proj, patient_matrix, provider_matrix,
+                       lr);
     }
 }
 
-void Trainer::processChunk(const std::vector<StreamingSample>& chunk,
+void Trainer::processChunk(const std::vector<GroupedSample>& chunk,
                            const Vocabulary& vocab,
                            Matrix& input_matrix, Matrix& output_matrix,
-                           Matrix& ngram_matrix, Matrix& metadata_matrix,
-                           std::vector<float>& gate_bias, std::vector<float>& alpha,
+                           Matrix& ngram_matrix,
+                           Matrix& W_proj,
+                           Matrix& patient_matrix,
+                           Matrix& provider_matrix,
                            float lr, double& loss_acc, int& pred_count) {
+    // BROADCAST: shared → thread-local.
+    broadcastDenseParams(W_proj, patient_matrix, provider_matrix);
+
+    // PROCESS: parallel over samples, each thread uses its own local copies.
     #pragma omp parallel for schedule(dynamic)
     for (int s = 0; s < static_cast<int>(chunk.size()); ++s) {
-        processSample(chunk[s], vocab, input_matrix, output_matrix,
-                      ngram_matrix, metadata_matrix, gate_bias, alpha, lr,
-                      omp_get_thread_num(), loss_acc, pred_count);
+        int tid = omp_get_thread_num();
+        processSample(chunk[s], vocab,
+                      input_matrix, output_matrix, ngram_matrix,
+                      W_proj_local_[tid],
+                      patient_local_[tid],
+                      provider_local_[tid],
+                      lr, tid, loss_acc, pred_count);
     }
+    // Implicit barrier at end of #pragma omp parallel for.
+
+    // REDUCE: average thread-local → shared dense params.
+    reduceDenseParams(W_proj, patient_matrix, provider_matrix);
 }
 
 void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
                        long long total_steps, const std::string& filename,
                        Vocabulary& vocab,
                        Matrix& input_matrix, Matrix& output_matrix,
-                       Matrix& ngram_matrix, Matrix& metadata_matrix,
-                       std::vector<float>& gate_bias, std::vector<float>& alpha) {
+                       Matrix& ngram_matrix,
+                       Matrix& W_proj, Matrix& patient_matrix, Matrix& provider_matrix) {
     std::ifstream file(filename);
     if (!file.is_open()) throw std::runtime_error("Cannot open: " + filename);
 
@@ -367,22 +447,23 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
     const float LR_FLOOR = lr_ * 0.0001f;
     const int   BAR_WIDTH = 40;
 
-    std::vector<StreamingSample> chunk;
+    std::vector<GroupedSample> chunk;
     chunk.reserve(chunk_size_);
-    StreamingSample sample;
+    GroupedSample sample;
     std::string line;
 
     auto flushChunk = [&]() {
         float lr = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
-        processChunk(chunk, vocab, input_matrix, output_matrix, ngram_matrix, metadata_matrix,
-                     gate_bias, alpha, lr, epoch_loss, epoch_preds);
+        processChunk(chunk, vocab, input_matrix, output_matrix, ngram_matrix,
+                     W_proj, patient_matrix, provider_matrix,
+                     lr, epoch_loss, epoch_preds);
         global_step += static_cast<long long>(chunk.size());
         processed   += static_cast<int>(chunk.size());
         chunk.clear();
     };
 
     while (std::getline(file, line)) {
-        if (parseLine(line, sample)) chunk.push_back(std::move(sample));
+        if (parseGroupedLine(line, sample)) chunk.push_back(std::move(sample));
         if (static_cast<int>(chunk.size()) < chunk_size_) continue;
         flushChunk();
 
@@ -420,30 +501,48 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
 
 void Trainer::train(const std::string& filename, Vocabulary& vocab,
                     Matrix& input_matrix, Matrix& output_matrix,
-                    Matrix& ngram_matrix, Matrix& metadata_matrix,
-                    std::vector<float>& gate_bias, std::vector<float>& alpha) {
+                    Matrix& ngram_matrix,
+                    Matrix& W_proj, Matrix& patient_matrix, Matrix& provider_matrix) {
     const int       total_samples = countLines(filename);
     const long long total_steps   = static_cast<long long>(total_samples) * epoch_;
     long long       global_step   = 0;
 
+    int T = omp_get_max_threads();
+
+    // Initialize thread-local dense parameter copies.
+    W_proj_local_.resize(T);
+    patient_local_.resize(T);
+    provider_local_.resize(T);
+    for (int t = 0; t < T; ++t) {
+        W_proj_local_[t].resize(W_proj.rows(), W_proj.cols());
+        patient_local_[t].resize(patient_matrix.rows(), patient_matrix.cols());
+        provider_local_[t].resize(provider_matrix.rows(), provider_matrix.cols());
+    }
+
     std::cout << "Samples: " << total_samples << " | Steps: " << total_steps
-              << " | Threads: " << omp_get_max_threads()
+              << " | Threads: " << T
               << " | Window: [1," << window_size_ << "] (sampled)\n"
               << "Subsampling: " << (!vocab.discard_probs_.empty() ? "enabled" : "disabled")
-              << " | SGD: Hogwild (lock-free)"
-              << " | Grad clip: " << (grad_clip_ > 0.0f ? std::to_string(grad_clip_) : "off")
-              << " | Gated metadata: word_part gate (OOV-safe)"
+              << " | Sparse updates: Hogwild (input, ngram, output)"
+              << " | Dense sync: chunk-averaged (W_proj, patient, provider)"
+              << " | Chunk size: " << chunk_size_
+              << " | Grad clip: " << (grad_clip_ > 0.0f ? std::to_string(grad_clip_) : "off") << " | W_proj decay: " << (weight_decay_ > 0.0f ? std::to_string(weight_decay_) : "off")
+              << "\nDimensions: d_w=" << d_w_ << " d_p=" << d_p_ << " d_pr=" << d_pr_
+              << " d_out=" << d_out_ << " concat=" << concat_dim_
+              << " W_proj=" << W_proj.rows() << "x" << W_proj.cols()
               << "\n";
 
     for (int ep = 0; ep < epoch_; ++ep) {
         runEpoch(ep, total_samples, global_step, total_steps, filename, vocab,
-                 input_matrix, output_matrix, ngram_matrix, metadata_matrix,
-                 gate_bias, alpha);
+                 input_matrix, output_matrix, ngram_matrix,
+                 W_proj, patient_matrix, provider_matrix);
 
-        bool healthy = checkMatrixHealth(output_matrix,  "output",   ep + 1)
-                    && checkMatrixHealth(ngram_matrix,    "ngram",    ep + 1)
-                    && checkMatrixHealth(metadata_matrix, "metadata", ep + 1)
-                    && checkMatrixHealth(input_matrix,    "input",    ep + 1);
+        bool healthy = checkMatrixHealth(output_matrix,   "output",   ep + 1)
+                    && checkMatrixHealth(ngram_matrix,     "ngram",    ep + 1)
+                    && checkMatrixHealth(patient_matrix,   "patient",  ep + 1)
+                    && checkMatrixHealth(provider_matrix,  "provider", ep + 1)
+                    && checkMatrixHealth(input_matrix,     "input",    ep + 1)
+                    && checkMatrixHealth(W_proj,           "W_proj",   ep + 1);
         if (!healthy) throw std::runtime_error("Training aborted: matrix corruption.");
     }
 

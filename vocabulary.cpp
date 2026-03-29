@@ -8,9 +8,10 @@
 namespace fasttext {
 
 void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& word_freq,
-                                 const std::unordered_map<std::string, int>& metadata_freq) {
+                                 const std::unordered_map<std::string, int>& patient_freq,
+                                 const std::unordered_map<std::string, int>& provider_freq) {
+    // Words: sort by frequency descending, apply threshold.
     int word_idx = 0, filtered = 0;
-
     std::vector<std::pair<std::string, int>> sorted_words(word_freq.begin(), word_freq.end());
     std::sort(sorted_words.begin(), sorted_words.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -26,22 +27,34 @@ void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& wor
         }
     }
 
-    int meta_idx = 0;
-    std::vector<std::pair<std::string, int>> sorted_meta(metadata_freq.begin(), metadata_freq.end());
-    std::sort(sorted_meta.begin(), sorted_meta.end(),
+    // Patient fields: all kept, sorted by frequency.
+    int pat_idx = 0;
+    std::vector<std::pair<std::string, int>> sorted_patient(patient_freq.begin(), patient_freq.end());
+    std::sort(sorted_patient.begin(), sorted_patient.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (const auto& [field, count] : sorted_patient) {
+        patient2idx_[field] = pat_idx;
+        idx2patient_.push_back(field);
+        ++pat_idx;
+    }
 
-    for (const auto& [meta, count] : sorted_meta) {
-        metadata2idx_[meta] = meta_idx;
-        idx2metadata_.push_back(meta);
-        ++meta_idx;
+    // Provider fields: all kept, sorted by frequency.
+    int prov_idx = 0;
+    std::vector<std::pair<std::string, int>> sorted_provider(provider_freq.begin(), provider_freq.end());
+    std::sort(sorted_provider.begin(), sorted_provider.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (const auto& [field, count] : sorted_provider) {
+        provider2idx_[field] = prov_idx;
+        idx2provider_.push_back(field);
+        ++prov_idx;
     }
 
     std::cout << "\n=== VOCABULARY BUILD SUMMARY ===\n"
-              << "Unique words in file:       " << word_freq.size()   << "\n"
+              << "Unique words in file:        " << word_freq.size()   << "\n"
               << "Words meeting threshold(" << threshold_ << "): " << word_idx  << "\n"
-              << "Words filtered out:         " << filtered            << "\n"
-              << "Metadata fields:            " << meta_idx            << "\n"
+              << "Words filtered out:          " << filtered            << "\n"
+              << "Patient metadata fields:     " << pat_idx             << "\n"
+              << "Provider metadata fields:    " << prov_idx            << "\n"
               << "================================\n" << std::endl;
 }
 
@@ -77,7 +90,7 @@ void Vocabulary::buildHuffmanTree() {
     for (int i = V; i < 2 * V - 1; ++i) {
         int min1 = pickMin(pos1, pos2);
         int min2 = pickMin(pos1, pos2);
-        count[i]    = count[min1] + count[min2];
+        count[i]     = count[min1] + count[min2];
         parent[min1] = i;
         parent[min2] = i;
         binary[min2] = 1;
@@ -111,8 +124,8 @@ void Vocabulary::computeDiscardProbs(float t) {
     if (total <= 0.0) return;
 
     for (int i = 0; i < V; ++i) {
-        double f   = word_freqs_[i] / total;
-        double p   = 1.0 - std::sqrt(static_cast<double>(t) / f);
+        double f = word_freqs_[i] / total;
+        double p = 1.0 - std::sqrt(static_cast<double>(t) / f);
         discard_probs_[i] = static_cast<float>(std::max(0.0, p));
     }
 }
