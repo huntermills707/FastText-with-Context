@@ -39,7 +39,7 @@ events = ["summit", "conference", "election", "crisis", "launch", "report"]
 problems = ["climate change", "inequality", "security breaches", "data privacy", "efficiency"]
 trends = ["upward", "downward", "volatile", "stable", "exponential", "linear"]
 
-def generate_training_file(filename="training_data_with_context.txt", num_rows=1000):
+def generate_training_file(filename="training_data_with_context.txt", num_rows=1_000_000):
 
     with open(filename, "w", encoding="utf-8") as f:
         for i in range(num_rows):
@@ -74,10 +74,14 @@ def generate_training_file(filename="training_data_with_context.txt", num_rows=1
                 trend=trend
             )
             
-            # Construct the row: context1|context2|context3|sentence
-            n = random.randint(0, 5)
-            elements = random.sample([author, domain, year, sentiment, location], n)
-            row = "|".join(map(str, [*elements, sentence]))
+            # Construct the row: context1|||context2|||sentence
+            n = random.randint(0, 3)
+            elements = random.sample([author, year, location], n)
+            ctx1 = " ".join(map(str, elements))
+            n = random.randint(0, 2)
+            elements = random.sample([domain, sentiment], n)
+            ctx2 = " ".join(map(str, elements))
+            row = " ||| ".join([ctx1, ctx2, sentence])
             f.write(row + "\n")
 
     print(f"Generated {num_rows} rows in '{filename}'")
