@@ -90,7 +90,7 @@ python3 generate_sentences.py   # writes training_data_with_context.txt (1M rows
 | `-d-word` | `150` | Word + n-gram embedding dimension |
 | `-d-patient` | `30` | Patient group embedding dimension |
 | `-d-provider` | `15` | Provider group embedding dimension |
-| `-d-out` | `150` | Output/projected dimension (HS and NN search operate here) |
+| `-d-out` | `150` | Output/projected dimension for HS (default: 150) |
 | `-epoch` | `5` | Training epochs |
 | `-lr` | `0.05` | Initial learning rate (linear decay to 0.01% of initial) |
 | `-minn` | `3` | Minimum character n-gram length |
@@ -233,35 +233,91 @@ ft.print_provider_vocab()
 
 ### Forward Pass (Single Center Word)
 
-```
-word_part    = word_emb[w] + sum(ngram_embs[w])           ∈ R^d_w
-patient_part = avg(patient_embs[active patient fields])   ∈ R^d_p   (zero if none)
-provider_part= avg(provider_embs[active provider fields]) ∈ R^d_pr  (zero if none)
+Given a center word $w$ at position $c$ in a sentence with patient fields $\mathcal{P}$ and provider fields $\mathcal{R}$:
 
-concat       = [word_part ; patient_part ; provider_part] ∈ R^concat_dim
-center_vec   = W_proj × concat                            ∈ R^d_out
-```
+$$\mathbf{v}_{\text{word}} = \mathbf{e}_w + \sum_{g \in \mathcal{G}(w)} \mathbf{n}_g \quad \in \mathbb{R}^{d_w}$$
 
-The `center_vec` enters the standard skip-gram hierarchical softmax loop unchanged.
+where $\mathbf{e}_w$ is the word embedding, $\mathcal{G}(w)$ is the set of character n-gram hash indices for $w$, and $\mathbf{n}_g$ are the n-gram embeddings.
 
-### Backward Pass Through Projection
+$$\mathbf{v}_{\text{patient}} = \frac{1}{|\mathcal{P}|} \sum_{p \in \mathcal{P}} \mathbf{m}_p \quad \in \mathbb{R}^{d_p} \qquad (\mathbf{0} \text{ if } \mathcal{P} = \emptyset)$$
 
-After accumulating `center_grad ∈ R^d_out` from the HS loop (and clipping by L2 norm):
+$$\mathbf{v}_{\text{provider}} = \frac{1}{|\mathcal{R}|} \sum_{r \in \mathcal{R}} \mathbf{m}_r \quad \in \mathbb{R}^{d_{pr}} \qquad (\mathbf{0} \text{ if } \mathcal{R} = \emptyset)$$
 
-```
-concat_grad  = W_proj^T × center_grad        (matrix-vector, concat_dim FLOPs)
-W_proj      += lr × center_grad × concat^T   (outer product update, thread-local)
-```
+The three parts are concatenated and projected into the output space:
 
-`concat_grad` is sliced into `word_grad`, `patient_grad`, `provider_grad` and distributed:
+$$\mathbf{z} = \begin{bmatrix} \mathbf{v}_{\text{word}} \\ \mathbf{v}_{\text{patient}} \\ \mathbf{v}_{\text{provider}} \end{bmatrix} \in \mathbb{R}^{d_{\text{concat}}}$$
 
-- `word_grad` → `input_matrix[word]` and each `ngram_matrix[idx]` (Hogwild)
-- `patient_grad / N_patient` → each active `patient_matrix[idx]` (thread-local)
-- `provider_grad / N_provider` → each active `provider_matrix[idx]` (thread-local)
+$$\mathbf{h} = W_{\text{proj}} \, \mathbf{z} \quad \in \mathbb{R}^{d_{\text{out}}}$$
+
+The projected vector $\mathbf{h}$ enters the skip-gram hierarchical softmax loop.
+
+### Loss Function
+
+For each context word $w_o$ within the sampled skip-gram window around center word $w_c$, the hierarchical softmax loss traverses the Huffman path $\{(n_1, d_1), \ldots, (n_L, d_L)\}$ from root to $w_o$, where $n_i$ is the $i$-th internal node and $d_i \in \{0, 1\}$ is the Huffman code bit (left or right branch):
+
+$$\mathcal{L}(w_c, w_o) = -\sum_{i=1}^{L} \Big[ \, t_i \log \sigma(\mathbf{u}_{n_i}^\top \mathbf{h}) + (1 - t_i) \log \big(1 - \sigma(\mathbf{u}_{n_i}^\top \mathbf{h})\big) \Big]$$
+
+where $\sigma(x) = \frac{1}{1 + e^{-x}}$ is the sigmoid function, $\mathbf{u}_{n_i} \in \mathbb{R}^{d_{\text{out}}}$ is the output vector for internal node $n_i$, and $t_i = 1 - d_i$ maps the Huffman code to a binary target (left child $\to 1$, right child $\to 0$).
+
+The total training loss over a sentence with $T$ words is:
+
+$$\mathcal{L}_{\text{total}} = \sum_{c=1}^{T} \sum_{\substack{o = c - \tilde{w} \\ o \neq c}}^{c + \tilde{w}} \mathcal{L}(w_c, w_o)$$
+
+where $\tilde{w} \sim \text{Uniform}\{1, \ldots, W\}$ is the sampled window size for each center word.
+
+### Gradients
+
+At each internal node $n_i$ along the Huffman path, the scalar gradient signal is:
+
+$$g_i = \eta \, (t_i - \sigma(\mathbf{u}_{n_i}^\top \mathbf{h}))$$
+
+where $\eta$ is the current learning rate (linearly decayed).
+
+**Output node update** (Hogwild, applied immediately per node, clipped to max L2 norm $\gamma$):
+
+$$\Delta \mathbf{u}_{n_i} = \text{clip}_\gamma \big( g_i \, \mathbf{h} \big)$$
+
+$$\mathbf{u}_{n_i} \leftarrow \mathbf{u}_{n_i} + \Delta \mathbf{u}_{n_i}$$
+
+**Center gradient accumulation** across all nodes on the path and all context words:
+
+$$\nabla_{\mathbf{h}} = \text{clip}_\gamma \left( \sum_{i=1}^{L} g_i \, \mathbf{u}_{n_i} \right)$$
+
+where $\text{clip}_\gamma(\mathbf{v}) = \mathbf{v} \cdot \min\!\left(1, \, \frac{\gamma}{\|\mathbf{v}\|_2}\right)$ rescales the vector if its L2 norm exceeds $\gamma$.
+
+**Backpropagation through the projection:**
+
+$$\nabla_{\mathbf{z}} = W_{\text{proj}}^\top \, \nabla_{\mathbf{h}} \quad \in \mathbb{R}^{d_{\text{concat}}}$$
+
+$$W_{\text{proj}} \leftarrow W_{\text{proj}} + \eta \, \nabla_{\mathbf{h}} \, \mathbf{z}^\top \quad \text{(rank-1 outer product, thread-local)}$$
+
+The concatenated gradient $\nabla_{\mathbf{z}}$ is then sliced and distributed to the constituent embeddings:
+
+$$\nabla_{\mathbf{z}} = \begin{bmatrix} \nabla_{\text{word}} \\ \nabla_{\text{patient}} \\ \nabla_{\text{provider}} \end{bmatrix}$$
+
+**Word embedding updates** (Hogwild):
+
+$$\mathbf{e}_w \leftarrow \mathbf{e}_w + \eta \, \nabla_{\text{word}}$$
+
+$$\mathbf{n}_g \leftarrow \mathbf{n}_g + \eta \, \nabla_{\text{word}} \quad \forall \, g \in \mathcal{G}(w)$$
+
+**Patient embedding updates** (thread-local, averaged across fields):
+
+$$\mathbf{m}_p \leftarrow \mathbf{m}_p + \frac{\eta}{|\mathcal{P}|} \, \nabla_{\text{patient}} \quad \forall \, p \in \mathcal{P}$$
+
+**Provider embedding updates** (thread-local, averaged across fields):
+
+$$\mathbf{m}_r \leftarrow \mathbf{m}_r + \frac{\eta}{|\mathcal{R}|} \, \nabla_{\text{provider}} \quad \forall \, r \in \mathcal{R}$$
+
+**Weight decay** (applied to $W_{\text{proj}}$ after each chunk reduce):
+
+$$W_{\text{proj}} \leftarrow (1 - \lambda) \, W_{\text{proj}}$$
+
+where $\lambda$ is the weight decay coefficient.
 
 ### Synchronization Protocol
 
-Dense parameters (`W_proj`, `patient_matrix`, `provider_matrix`) use thread-local copies with a per-chunk broadcast → process → reduce cycle:
+Dense parameters ($W_{\text{proj}}$, `patient_matrix`, `provider_matrix`) use thread-local copies with a per-chunk broadcast → process → reduce cycle:
 
 1. **Broadcast**: copy shared dense params to all thread-local copies (sequential, before parallel region)
 2. **Process**: threads update their local copies in parallel (no contention on dense params)
@@ -275,12 +331,11 @@ This approach has one synchronization point per 1000 samples rather than one per
 
 At query time:
 
-```
-concat  = [avg(word_vecs) ; avg(patient_vecs) ; avg(provider_vecs)]
-result  = L2_normalise(W_proj × concat)
-```
+$$\mathbf{z}_q = \begin{bmatrix} \frac{1}{|\mathcal{W}|} \sum_{w \in \mathcal{W}} \mathbf{v}_{\text{word}}(w) \\ \frac{1}{|\mathcal{P}|} \sum_{p \in \mathcal{P}} \mathbf{m}_p \\ \frac{1}{|\mathcal{R}|} \sum_{r \in \mathcal{R}} \mathbf{m}_r \end{bmatrix}$$
 
-For nearest-neighbor search, a cache of precomputed word-only projected vectors (`vocab_size × d_out`) is held in memory. Candidate scoring uses this cache; the query vector includes metadata. Both live in the same `d_out` space so cosine similarity is well-defined.
+$$\mathbf{q} = \frac{W_{\text{proj}} \, \mathbf{z}_q}{\| W_{\text{proj}} \, \mathbf{z}_q \|_2}$$
+
+For nearest-neighbor search, a cache of precomputed word-only projected vectors (`vocab_size × d_out`) is held in memory. Candidate scoring uses this cache; the query vector includes metadata. Both live in the same $d_{\text{out}}$ space so cosine similarity is well-defined.
 
 ### Memory Layout
 
@@ -295,19 +350,77 @@ For nearest-neighbor search, a cache of precomputed word-only projected vectors 
 
 ### Extending to a Fourth Group
 
-To add an outcome group (dimension `d_o`):
+To add an outcome group (dimension $d_o$):
 
 1. Add `outcome_fields` to `GroupedSample` in `types.h`.
 2. Add `outcome2idx_` / `outcomeSize()` to `Vocabulary`.
 3. Add `outcome_matrix_` (`outcome_vocab × d_o`) to `FastTextContext` and `Trainer`.
-4. Widen `W_proj` from `d_out × (d_w+d_p+d_pr)` to `d_out × (d_w+d_p+d_pr+d_o)`.
+4. Widen $W_{\text{proj}}$ from $d_{\text{out}} \times (d_w + d_p + d_{pr})$ to $d_{\text{out}} \times (d_w + d_p + d_{pr} + d_o)$.
 5. Extend `buildConcatVec`, `distributeGrad`, `getCombinedVector`, and the Python loader to handle the new slice.
 
 No structural changes to the HS loop, synchronization protocol, or save/load format beyond the new sizes.
 
 ## MIMIC-III Preprocessing
 
-The preprocessing script at `mimic-iii/mimic-iii-preprocess.py` reads ADMISSIONS, PATIENTS, CAREGIVERS, and NOTEEVENTS, cleans and sentence-segments clinical notes, and writes the triple-pipe format:
+A three-step pipeline in `mimic-iii/` converts raw MIMIC-III CSV tables into the triple-pipe training format. Each step reads the previous step's output, so they must be run in order. The pipeline is designed for low peak RAM usage: step 1 streams via Polars LazyFrames, step 2 processes notes in configurable batches with multiprocessing, and step 3 operates on compact numpy index arrays rather than copying strings.
+
+**Prerequisites:**
+
+```bash
+cd mimic-iii
+pip install -r requirements.txt   # polars, pyarrow, nltk, numpy, tqdm
+```
+
+MIMIC-III source files required in the working directory (or specify `--data-dir`): `ADMISSIONS.csv`, `PATIENTS.csv`, `CAREGIVERS.csv`, and `NOTEEVENTS.parquet`. Convert NOTEEVENTS from CSV first if needed:
+
+```bash
+python3 -c "import polars as pl; pl.read_csv('NOTEEVENTS.csv').write_parquet('NOTEEVENTS.parquet')"
+```
+
+### Step 1: Merge Source Tables (`01_merge.py`)
+
+Joins ADMISSIONS, PATIENTS, CAREGIVERS, and NOTEEVENTS into a single parquet with context columns and raw note text. Uses Polars `sink_parquet()` for streaming execution — the full joined table is never resident in RAM.
+
+Derived columns: MeSH age category (from admission date and DOB), death flag. All metadata columns are lowercased with spaces replaced by underscores.
+
+```bash
+python3 01_merge.py [--data-dir /path/to/csvs] [--out mimic-iii-merged.parquet]
+```
+
+**Output columns:** `SUBJECT_ID`, `ROW_ID`, `MeSH`, `GENDER`, `ETHNICITY`, `LANGUAGE`, `RELIGION`, `MARITAL_STATUS`, `INSURANCE`, `CG_TITLE`, `ADMISSION_TYPE`, `TEXT`.
+
+### Step 2: Sentence Segmentation (`02_to_sentences.py`)
+
+Reads the merged parquet and runs NLP processing on each note: NLTK sentence tokenization, de-identification tag stripping (`[** ... **]`), lowercasing, digit removal, non-alpha filtering, and minimum length filtering. Processing is parallelized across worker processes and batched to control memory usage. Output is written incrementally via PyArrow's `ParquetWriter`.
+
+```bash
+python3 02_to_sentences.py [--input mimic-iii-merged.parquet] \
+                           [--out mimic-iii-sents.parquet]    \
+                           [--batch-size 5000]                \
+                           [--workers N]                      \
+                           [--min-len 20]
+```
+
+**Output columns:** `SUBJECT_ID`, `ROW_ID`, `PatientGroup`, `ProviderGroup`, `Sentences` (list of cleaned sentence strings). Patient and provider group strings are pre-computed so step 3 needs no further NLP work.
+
+### Step 3: Generate Training Text (`03_to_text.py`)
+
+Explodes the sentences parquet into the final triple-pipe text file, one sentence per line, shuffled. Operates on compact numpy index arrays rather than copying string data — peak RAM is the string data itself plus lightweight int32/int16 index arrays.
+
+```bash
+# Default: all notes, shuffled
+python3 03_to_text.py [--input mimic-iii-sents.parquet] [--out mimic-iii-sents.txt]
+
+# Bootstrap sample (two-stage hierarchical, fully reproducible)
+python3 03_to_text.py --bootstrap-seed 42 --out mimic-iii-sents-boot42.txt
+
+# Default dataset with reproducible shuffle
+python3 03_to_text.py --shuffle-seed 7
+```
+
+**Bootstrap mode** (`--bootstrap-seed N`) implements a two-stage hierarchical bootstrap that respects the correlation structure of notes within patients: stage 1 resamples patient IDs with replacement, stage 2 resamples each sampled patient's notes with replacement (preserving original note count). This is the statistically correct bootstrap for clustered data. Bootstrap and shuffle seeds use separate RNG generators and are fully orthogonal.
+
+**Output format** (one line per sentence):
 
 ```
 elderly male white english medicare ||| attending emergency ||| the patient presented with dyspnea
@@ -316,9 +429,15 @@ elderly male white english medicare ||| attending emergency ||| the patient pres
 Patient columns: MeSH age category, gender, ethnicity, language, religion, marital status, insurance.
 Provider columns: caregiver title, admission type.
 
+### Full Pipeline
+
 ```bash
 cd mimic-iii
-python3 mimic-iii-preprocess.py   # writes mimic-iii-sents.txt
+python3 01_merge.py                          # → mimic-iii-merged.parquet
+python3 02_to_sentences.py                   # → mimic-iii-sents.parquet
+python3 03_to_text.py                        # → mimic-iii-sents.txt
+cd ..
+./train mimic-iii/mimic-iii-sents.txt model.bin
 ```
 
 ## Performance Tuning
@@ -374,7 +493,10 @@ ft.print_projection_block_norms()
 ├── generate_sentences.py   # Synthetic training data generator (triple-pipe format)
 ├── Makefile
 ├── mimic-iii/
-│   └── mimic-iii-preprocess.py   # MIMIC-III preprocessing → triple-pipe format
+│   ├── 01_merge.py         # Step 1: join source tables → merged parquet
+│   ├── 02_to_sentences.py  # Step 2: NLP sentence segmentation → sentences parquet
+│   ├── 03_to_text.py       # Step 3: explode & shuffle → triple-pipe training text
+│   └── requirements.txt    # Python dependencies for preprocessing
 └── README.md
 ```
 
