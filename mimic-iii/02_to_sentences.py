@@ -54,7 +54,7 @@ PATIENT_COLS = [
     'RELIGION', 'MARITAL_STATUS', 'INSURANCE',
 ]
 PROVIDER_COLS = [
-    'CG_TITLE', 'ADMISSION_TYPE',
+    'CG_TITLE', 'ADMISSION_TYPE', 'LOS', 'DEATH'
 ]
 
 # ------------------------------------------------------------------
@@ -114,7 +114,7 @@ def _group_str(row: dict, cols: list) -> str:
         val = row.get(col)
         if val is None:
             continue
-        s = str(val).replace(' ', '_')
+        s = f"{col}:{str(val).replace(' ', '_')}"
         if 'unknown' not in s.lower():
             parts.append(s)
     return ' '.join(parts)

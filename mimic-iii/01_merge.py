@@ -34,7 +34,7 @@ PATIENT_COLS = [
 
 # Provider-level columns kept in the output.
 PROVIDER_COLS = [
-    'CG_TITLE', 'ADMISSION_TYPE',
+    'CG_TITLE', 'ADMISSION_TYPE', 'LOS', 'DEATH'
 ]
 
 
@@ -55,9 +55,8 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
           .otherwise(pl.lit('Alive'))
           .alias('DEATH')
     ).select([
-        'HADM_ID', 'ADMITTIME', 'ADMISSION_TYPE',
-        'INSURANCE', 'LANGUAGE', 'RELIGION',
-        'MARITAL_STATUS', 'ETHNICITY', 'DEATH',
+        'HADM_ID', 'ADMITTIME', 'DISCHTIME', 'ADMISSION_TYPE', 'INSURANCE',
+        'LANGUAGE', 'RELIGION', 'MARITAL_STATUS', 'ETHNICITY', 'DEATH',
     ])
 
     caregivers = caregivers.select(['CGID', 'LABEL']).rename({'LABEL': 'CG_TITLE'})
@@ -85,8 +84,15 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     # ------------------------------------------------------------------
     notes = notes.with_columns([
         pl.col('ADMITTIME').str.to_datetime(strict=False),
+        pl.col('DISCHTIME').str.to_datetime(strict=False),
         pl.col('DOB').str.to_datetime(strict=False),
     ])
+
+    notes = notes.with_columns(
+        ((pl.col('DISCHTIME') - pl.col('ADMITTIME')).dt.total_days())
+        .floor()
+        .alias('LOS')
+    )
 
     notes = notes.with_columns(
         ((pl.col('ADMITTIME') - pl.col('DOB')).dt.total_days() / 365.0)

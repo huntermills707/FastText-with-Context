@@ -57,7 +57,7 @@ elderly male ||| ||| no acute distress noted on examination
 A synthetic data generator is included:
 
 ```bash
-python3 generate_sentences.py   # writes training_data_with_context.txt (1M rows)
+python3 generate_demo_sentences.py   # writes training_data_with_context.txt (1M rows)
 ```
 
 ## Usage
@@ -490,7 +490,7 @@ ft.print_projection_block_norms()
 ├── query.cpp               # CLI: nearest-neighbor queries
 ├── compare.cpp             # CLI: vector comparison
 ├── fasttext_context.py     # Python loader (numpy only)
-├── generate_sentences.py   # Synthetic training data generator (triple-pipe format)
+├── generate_demo_sentences.py   # Synthetic training data generator (triple-pipe format)
 ├── Makefile
 ├── mimic-iii/
 │   ├── 01_merge.py         # Step 1: join source tables → merged parquet
