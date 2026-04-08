@@ -24,6 +24,10 @@ import sys
 import time
 from pathlib import Path
 import polars as pl
+from mappings import (
+    _CG_MAP, _RELIGION_MAP, _LANGUAGE_MAP, _ETHNICITY_MAP,
+    map_cg_title, map_religion, map_language, map_ethnicity
+)
 
 
 # Patient-level columns kept in the output.
@@ -36,6 +40,8 @@ PATIENT_COLS = [
 PROVIDER_COLS = [
     'CG_TITLE', 'ADMISSION_TYPE', 'LOS', 'DEATH'
 ]
+
+# --- Pipeline helpers --------------------------------------------------
 
 
 def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
@@ -59,7 +65,14 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
         'LANGUAGE', 'RELIGION', 'MARITAL_STATUS', 'ETHNICITY', 'DEATH',
     ])
 
-    caregivers = caregivers.select(['CGID', 'LABEL']).rename({'LABEL': 'CG_TITLE'})
+    # ------------------------------------------------------------------
+    # Pre-process Caregivers: Rename and group titles.
+    # ------------------------------------------------------------------
+    caregivers = (
+        caregivers
+        .select(['CGID', 'LABEL'])
+        .rename({'LABEL': 'CG_TITLE'})
+    )
 
     notes = notes.select(['ROW_ID', 'SUBJECT_ID', 'HADM_ID', 'CGID', 'TEXT'])
 
@@ -89,12 +102,6 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     ])
 
     notes = notes.with_columns(
-        ((pl.col('DISCHTIME') - pl.col('ADMITTIME')).dt.total_days())
-        .floor()
-        .alias('LOS')
-    )
-
-    notes = notes.with_columns(
         ((pl.col('ADMITTIME') - pl.col('DOB')).dt.total_days() / 365.0)
         .floor()
         .alias('age')
@@ -113,7 +120,56 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     )
 
     # ------------------------------------------------------------------
-    # Normalise metadata: lowercase, spaces → underscores.
+    # Length of Stay Calculation --> to Category.
+    # ------------------------------------------------------------------
+
+    notes = notes.with_columns(
+        ((pl.col('DISCHTIME') - pl.col('ADMITTIME')).dt.total_days())
+        .floor()
+        .alias('LOS')
+    )
+
+    notes = notes.with_columns(
+        pl.when(pl.col('LOS') >= 30).then(pl.lit('Long'))
+        .when(pl.col('LOS') >= 14).then(pl.lit('Prolonged'))
+        .when(pl.col('LOS') >= 7).then(pl.lit('Extended'))
+        .when(pl.col('LOS') >= 3).then(pl.lit('Moderate'))
+        .otherwise(pl.lit('Short'))
+        .alias('LOS')
+    )
+
+
+    # ------------------------------------------------------------------
+    # Normalise and group patient/admission metadata.
+    # ------------------------------------------------------------------
+    notes = notes.with_columns([
+        pl.col('RELIGION')
+        .str.strip_chars()
+        .str.to_lowercase()
+        .str.replace_all(' ', '_')
+        .replace_strict(_RELIGION_MAP, default='unknown'),
+
+        pl.col('LANGUAGE')
+        .str.strip_chars()
+        .str.to_lowercase()
+        .str.replace_all(' ', '_')
+        .replace_strict(_LANGUAGE_MAP, default='unknown'),
+
+        pl.col('ETHNICITY')
+        .str.strip_chars()
+        .str.to_lowercase()
+        .str.replace_all(' ', '_')
+        .replace_strict(_ETHNICITY_MAP, default='unknown'),
+
+        pl.col('CG_TITLE')
+        .str.strip_chars()
+        .str.to_lowercase()
+        .str.replace_all(' ', '_')
+        .replace_strict(_CG_MAP, default='unknown'),
+    ])
+
+    # ------------------------------------------------------------------
+    # Normalise remaining metadata: lowercase, spaces → underscores.
     # ------------------------------------------------------------------
     all_meta_cols = PATIENT_COLS + PROVIDER_COLS
     notes = notes.with_columns([
