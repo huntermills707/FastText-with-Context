@@ -102,28 +102,27 @@ def _index_pairs_bootstrap(
     # Stage 1: bootstrap patients.
     sampled_pids = rng.choice(patient_ids, size=n_patients, replace=True)
 
-    # Stage 2: for each sampled patient, bootstrap notes and collect sentences.
-    # Pre-size the output arrays to avoid repeated reallocation.
-    # Compute expected total sentences for pre-allocation.
-    total = sum(
-        len(sentences_col[ni])
-        for pid in sampled_pids
-        for ni in pid_to_indices[int(pid)]
-    )
-    note_idx = np.empty(total, dtype=np.int32)
-    sent_idx = np.empty(total, dtype=np.int16)
-
-    pos = 0
+    # Stage 2: for each sampled patient, bootstrap notes and collect sampled note indices.
+    sampled_note_indices = []
     for pid in sampled_pids:
         orig = pid_to_indices[int(pid)]
         n    = len(orig)
         for i in rng.integers(0, n, size=n):
-            ni    = orig[i]
-            sents = sentences_col[ni]
-            ns    = len(sents)
-            note_idx[pos:pos + ns] = ni
-            sent_idx[pos:pos + ns] = np.arange(ns, dtype=np.int16)
-            pos += ns
+            sampled_note_indices.append(orig[i])
+
+    # Pre-size the output arrays to avoid repeated reallocation.
+    # Compute actual total sentences from the sampled notes.
+    total = sum(len(sentences_col[ni]) for ni in sampled_note_indices)
+    note_idx = np.empty(total, dtype=np.int32)
+    sent_idx = np.empty(total, dtype=np.int16)
+
+    pos = 0
+    for ni in sampled_note_indices:
+        sents = sentences_col[ni]
+        ns    = len(sents)
+        note_idx[pos:pos + ns] = ni
+        sent_idx[pos:pos + ns] = np.arange(ns, dtype=np.int16)
+        pos += ns
 
     return note_idx, sent_idx
 
