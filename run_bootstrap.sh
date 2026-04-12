@@ -10,7 +10,8 @@ WD=1e-5
 NUM_BOOTSTRAPS=25
 
 echo "=== Running Original Dataset Training ==="
-python3 mimic-iii/03_to_text.py --input "$INPUT_PARQUET" --out "$ORIGINAL_TEXT"
+python3 mimic-iii/03_to_text.py --input "$INPUT_PARQUET" --out "$ORIGINAL_TEXT" \
+                                --shuffle-seed 42
 ./train -lr $LR -weight-decay $WD "$ORIGINAL_TEXT" "$ORIGINAL_MODEL"
 
 echo "=== Running $NUM_BOOTSTRAPS Bootstraps ==="
@@ -20,7 +21,8 @@ for i in $(seq 1 $NUM_BOOTSTRAPS); do
     SEED=$i # Use the loop index as the seed for repeatability
 
     echo "--- Bootstrap $i (Seed: $SEED) ---"
-    python3 mimic-iii/03_to_text.py --input "$INPUT_PARQUET" --out "$BOOT_TEXT" --bootstrap-seed $SEED
+    python3 mimic-iii/03_to_text.py --input "$INPUT_PARQUET" --out "$BOOT_TEXT" \
+                                    --bootstrap-seed $SEED --shuffle-seed $SEED
     ./train -lr $LR -weight-decay $WD "$BOOT_TEXT" "$BOOT_MODEL"
     
     # Optionally remove the bootstrap text file to save space
