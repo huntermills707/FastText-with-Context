@@ -1,4 +1,5 @@
 import sys
+from itertools import product
 import os
 import numpy as np
 from typing import List, Tuple
@@ -6,14 +7,10 @@ from fasttext_context import FastTextContext
 
 def parse_line(line: str) -> Tuple[List[str], List[str], List[str]]:
     """Parse a line with 'words' 'patients' 'providers' format."""
-    parts = line.strip().split()
-    if len(parts) >= 3:
-        return [parts[0]], [parts[1]], [parts[2]]
-    elif len(parts) == 2:
-        return [parts[0]], [parts[1]], []
-    elif len(parts) == 1:
-        return [parts[0]], [], []
-    return [], [], []
+    parts = line.strip().split("|||")
+    return (parts[0].strip().split(),
+            parts[1].strip().split(),
+            parts[2].strip().split())
 
 def calculate_similarity(model: FastTextContext, base: Tuple, target: Tuple) -> float:
     v1 = model.get_combined_vector(base[0], base[1], base[2])
@@ -58,25 +55,21 @@ def main():
     with open(targets_file, 'r') as f:
         targets = [parse_line(line) for line in f if line.strip()]
 
-    if len(bases) != len(targets):
-        print(f"Error: Number of rows in {bases_file} ({len(bases)}) and {targets_file} ({len(targets)}) must match.")
-        sys.exit(1)
-
     # Read similarities
-    all_boot_sims = [[] for _ in range(len(bases))]
+    all_boot_sims = [[] for _ in range(len(bases) * len(targets))]
 
     for boot_path in boot_models:
         print(f"Loading bootstrap model: {boot_path}")
         temp_model = FastTextContext()
         temp_model.load_model(boot_path)
-        for i, (b, t) in enumerate(zip(bases, targets)):
+        for i, (b, t) in enumerate(product(bases, targets)):
             all_boot_sims[i].append(calculate_similarity(temp_model, b, t))
         del temp_model
 
     print(f"{'Base':<40} | {'Target':<40} | {'Original':>8} | {'95% CI':<20}")
     print("-" * 120)
 
-    for i, (b, t) in enumerate(zip(bases, targets)):
+    for i, (b, t) in enumerate(product(bases, targets)):
         # Original similarity
         orig_sim = calculate_similarity(orig_model, b, t)
         
@@ -90,7 +83,7 @@ def main():
         else:
             ci_str = "N/A"
 
-        base_str = f"{b[0][0] if b[0] else ''} {b[1][0] if b[1] else ''} {b[2][0] if b[2] else ''}"
+        base_str = f"{' '.join(b[0]) if b[0] else ''} {b[1][0] if b[1] else ''} {b[2][0] if b[2] else ''}"
         target_str = f"{t[0][0] if t[0] else ''} {t[1][0] if t[1] else ''} {t[2][0] if t[2] else ''}"
         print(f"{base_str[:40]:<40} | {target_str[:40]:<40} | {orig_sim:8.4f} | {ci_str}")
 
