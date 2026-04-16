@@ -2,6 +2,8 @@
 
 A high-performance C++ implementation of FastText extended with a **concatenation-with-projection** architecture for stratified metadata groups. Built from scratch with OpenMP parallelization, it supports streaming training on large datasets and learns separate low-dimensional embeddings for each metadata group (patients, providers), which are concatenated and projected into a shared output space.
 
+The project ships with a MIMIC-III preprocessing pipeline, a two-stage hierarchical bootstrap workflow for confidence intervals, and a pure-numpy Python loader for inference and diagnostics.
+
 ## Key Features
 
 - **Stratified Metadata Groups**: Each metadata group (patient demographics, provider role) gets its own embedding space and dimension. Groups are concatenated and projected through a learned matrix rather than additively combined.
@@ -11,17 +13,21 @@ A high-performance C++ implementation of FastText extended with a **concatenatio
 - **Streaming Training**: Two-pass architecture (vocabulary counting → training) handles datasets larger than RAM.
 - **Hierarchical Softmax**: Huffman tree construction for O(log V) training complexity.
 - **Subword Awareness**: Character n-grams (configurable range) handle out-of-vocabulary words.
-- **Three Binaries**:
+- **Statistical Uncertainty**: Two-stage hierarchical bootstrap (patients → notes) for computing 95% confidence intervals on any similarity query, via `run_bootstrap.sh` + `compare_bootstrap.py`.
+- **C++ Binaries**:
   - `train`: Streamlined training pipeline.
   - `query`: Interactive nearest-neighbor search with grouped metadata.
   - `compare`: Cosine/Euclidean similarity between complex word + metadata combinations.
-- **Python Loader**: Pure-numpy `fasttext_context.py` for inference and diagnostics without recompiling.
+- **Python Tooling**:
+  - `fasttext_context.py`: Pure-numpy model loader for inference and diagnostics.
+  - `compare_bootstrap.py`: Bootstrap-based similarity with 95% CIs.
+  - `dump_metadata.py`: Export patient/provider vocabularies for inspection.
 
 ## Prerequisites
 
 - **Compiler**: GCC 7+ or Clang 5+ (C++17 required)
 - **Libraries**: OpenMP (`libgomp` or `libomp`)
-- **Python** (optional): `numpy`
+- **Python** (optional): `numpy`; `polars`, `pyarrow`, `nltk`, `tqdm` for MIMIC-III preprocessing.
 
 ## Building
 
@@ -31,6 +37,17 @@ make clean
 ```
 
 Default compiler flags: `-O3 -std=c++17 -march=native -fopenmp`
+
+## Quick Start
+
+Train a model on synthetic data in under a minute to verify the build:
+
+```bash
+make all
+python3 generate_demo_sentences.py          # writes training_data_with_context.txt (1M rows)
+./train -epoch 3 training_data_with_context.txt model.bin
+./query model.bin chest pain --k 10
+```
 
 ## Data Format
 
@@ -52,12 +69,6 @@ elderly male white english medicare married ||| attending emergency ||| the pati
 aged female hispanic ||| resident_physician elective ||| scheduled for elective knee replacement
  ||| nurse urgent ||| vital signs were stable on admission
 elderly male ||| ||| no acute distress noted on examination
-```
-
-A synthetic data generator is included:
-
-```bash
-python3 generate_demo_sentences.py   # writes training_data_with_context.txt (1M rows)
 ```
 
 ## Usage
@@ -90,7 +101,7 @@ python3 generate_demo_sentences.py   # writes training_data_with_context.txt (1M
 | `-d-word` | `150` | Word + n-gram embedding dimension |
 | `-d-patient` | `30` | Patient group embedding dimension |
 | `-d-provider` | `15` | Provider group embedding dimension |
-| `-d-out` | `150` | Output/projected dimension for HS (default: 150) |
+| `-d-out` | `150` | Output/projected dimension for HS |
 | `-epoch` | `5` | Training epochs |
 | `-lr` | `0.05` | Initial learning rate (linear decay to 0.01% of initial) |
 | `-minn` | `3` | Minimum character n-gram length |
@@ -168,6 +179,79 @@ Calculate similarity metrics between two queries, each with independent metadata
 --- Interpretation ---
   Very similar
 ```
+
+### 4. Bootstrap Training Workflow
+
+`run_bootstrap.sh` automates training an original model plus N bootstrap replicates. Each bootstrap uses `03_to_text.py --bootstrap-seed $i` (two-stage hierarchical resampling over patients and notes) so the resulting ensemble captures correct uncertainty for clustered note data.
+
+```bash
+./run_bootstrap.sh
+```
+
+**Configuration** (edit at the top of the script):
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INPUT_PARQUET` | `mimic-iii/mimic-iii-sents.parquet` | Sentences parquet from step 2 of the MIMIC-III pipeline |
+| `ORIGINAL_TEXT` | `mimic-iii/mimic-iii-sents.txt` | Path for the non-bootstrapped training text |
+| `ORIGINAL_MODEL` | `model.bin` | Output path for the original model |
+| `LR` | `0.02` | Learning rate passed to `./train` |
+| `WD` | `1e-5` | Weight decay on `W_proj` |
+| `NUM_BOOTSTRAPS` | `25` | Number of bootstrap replicates |
+
+The script writes `model.bin` plus `model_boot_1.bin` ... `model_boot_N.bin`. Bootstrap text files are deleted after each run to save disk space.
+
+### 5. Bootstrap Confidence Intervals
+
+Once the ensemble is trained, `compare_bootstrap.py` computes 95% CIs on the cosine similarity between pairs of queries by scoring each pair across every bootstrap replicate.
+
+**Input files** — two plain-text files in triple-pipe format, one query per line:
+
+```
+# bases.txt
+chest pain ||| elderly male ||| attending
+shortness of breath ||| young_adult female ||| resident_physician
+
+# targets.txt
+dyspnea ||| elderly male ||| attending
+myocardial infarction ||| aged male ||| attending
+```
+
+**Run:**
+
+```bash
+python3 compare_bootstrap.py <bases_file> <targets_file> [model_prefix]
+```
+
+Auto-discovers `<model_prefix>_boot_1.bin`, `<model_prefix>_boot_2.bin`, ... and compares the original point estimate to the empirical 95% interval (2.5th – 97.5th percentile) across the ensemble:
+
+```bash
+python3 compare_bootstrap.py bases.txt targets.txt model
+```
+
+**Output** (one row per base × target pair):
+
+```
+Base                                     | Target                                   | Original |       95% CI
+-------------------------------------------------------------------------------------------------------------
+chest pain elderly attending             | dyspnea elderly attending                |   0.8421 | [0.8156, 0.8689]
+chest pain elderly attending             | myocardial infarction aged attending     |   0.7123 | [0.6801, 0.7452]
+```
+
+### 6. Inspecting Metadata Vocabularies
+
+`dump_metadata.py` writes out the learned patient and provider vocabularies from a trained model — useful for sanity-checking field normalization and for assembling query inputs.
+
+```bash
+python3 dump_metadata.py    # reads mimic-iii.bin by default
+```
+
+**Outputs:**
+
+- `patient_metadata.txt` — one patient field per line, sorted.
+- `provider_metadata.txt` — one provider field per line, sorted.
+
+The model path is hardcoded to `mimic-iii.bin` at the top of the script; edit it there to point at a different model.
 
 ## Python Integration
 
@@ -264,56 +348,6 @@ The total training loss over a sentence with $T$ words is:
 $$\mathcal{L}_{\text{total}} = \sum_{c=1}^{T} \sum_{\substack{o = c - \tilde{w} \\ o \neq c}}^{c + \tilde{w}} \mathcal{L}(w_c, w_o)$$
 
 where $\tilde{w} \sim \text{Uniform}\{1, \ldots, W\}$ is the sampled window size for each center word.
-
-### Gradients
-
-At each internal node $n_i$ along the Huffman path, the scalar gradient signal is:
-
-$$g_i = \eta \, (t_i - \sigma(\mathbf{u}_{n_i}^\top \mathbf{h}))$$
-
-where $\eta$ is the current learning rate (linearly decayed).
-
-**Output node update** (Hogwild, applied immediately per node, clipped to max L2 norm $\gamma$):
-
-$$\Delta \mathbf{u}_{n_i} = \text{clip}_\gamma \big( g_i \, \mathbf{h} \big)$$
-
-$$\mathbf{u}_{n_i} \leftarrow \mathbf{u}_{n_i} + \Delta \mathbf{u}_{n_i}$$
-
-**Center gradient accumulation** across all nodes on the path and all context words:
-
-$$\nabla_{\mathbf{h}} = \text{clip}_\gamma \left( \sum_{i=1}^{L} g_i \, \mathbf{u}_{n_i} \right)$$
-
-where $\text{clip}_\gamma(\mathbf{v}) = \mathbf{v} \cdot \min\!\left(1, \, \frac{\gamma}{\|\mathbf{v}\|_2}\right)$ rescales the vector if its L2 norm exceeds $\gamma$.
-
-**Backpropagation through the projection:**
-
-$$\nabla_{\mathbf{z}} = W_{\text{proj}}^\top \, \nabla_{\mathbf{h}} \quad \in \mathbb{R}^{d_{\text{concat}}}$$
-
-$$W_{\text{proj}} \leftarrow W_{\text{proj}} + \eta \, \nabla_{\mathbf{h}} \, \mathbf{z}^\top \quad \text{(rank-1 outer product, thread-local)}$$
-
-The concatenated gradient $\nabla_{\mathbf{z}}$ is then sliced and distributed to the constituent embeddings:
-
-$$\nabla_{\mathbf{z}} = \begin{bmatrix} \nabla_{\text{word}} \\ \nabla_{\text{patient}} \\ \nabla_{\text{provider}} \end{bmatrix}$$
-
-**Word embedding updates** (Hogwild):
-
-$$\mathbf{e}_w \leftarrow \mathbf{e}_w + \eta \, \nabla_{\text{word}}$$
-
-$$\mathbf{n}_g \leftarrow \mathbf{n}_g + \eta \, \nabla_{\text{word}} \quad \forall \, g \in \mathcal{G}(w)$$
-
-**Patient embedding updates** (thread-local, averaged across fields):
-
-$$\mathbf{m}_p \leftarrow \mathbf{m}_p + \frac{\eta}{|\mathcal{P}|} \, \nabla_{\text{patient}} \quad \forall \, p \in \mathcal{P}$$
-
-**Provider embedding updates** (thread-local, averaged across fields):
-
-$$\mathbf{m}_r \leftarrow \mathbf{m}_r + \frac{\eta}{|\mathcal{R}|} \, \nabla_{\text{provider}} \quad \forall \, r \in \mathcal{R}$$
-
-**Weight decay** (applied to $W_{\text{proj}}$ after each chunk reduce):
-
-$$W_{\text{proj}} \leftarrow (1 - \lambda) \, W_{\text{proj}}$$
-
-where $\lambda$ is the weight decay coefficient.
 
 ### Synchronization Protocol
 
@@ -418,7 +452,7 @@ python3 03_to_text.py --bootstrap-seed 42 --out mimic-iii-sents-boot42.txt
 python3 03_to_text.py --shuffle-seed 7
 ```
 
-**Bootstrap mode** (`--bootstrap-seed N`) implements a two-stage hierarchical bootstrap that respects the correlation structure of notes within patients: stage 1 resamples patient IDs with replacement, stage 2 resamples each sampled patient's notes with replacement (preserving original note count). This is the statistically correct bootstrap for clustered data. Bootstrap and shuffle seeds use separate RNG generators and are fully orthogonal.
+**Bootstrap mode** (`--bootstrap-seed N`) implements a two-stage hierarchical bootstrap that respects the correlation structure of notes within patients: stage 1 resamples patient IDs with replacement, stage 2 resamples each sampled patient's notes with replacement (preserving original note count). This is the statistically correct bootstrap for clustered data. Bootstrap and shuffle seeds use separate RNG generators and are fully orthogonal. `run_bootstrap.sh` drives this mode in a loop to build a full ensemble.
 
 **Output format** (one line per sentence):
 
@@ -433,9 +467,9 @@ Provider columns: caregiver title, admission type.
 
 ```bash
 cd mimic-iii
-python3 01_merge.py                          # → mimic-iii-merged.parquet
-python3 02_to_sentences.py                   # → mimic-iii-sents.parquet
-python3 03_to_text.py                        # → mimic-iii-sents.txt
+python3 01_merge.py                          # -> mimic-iii-merged.parquet
+python3 02_to_sentences.py                   # -> mimic-iii-sents.parquet
+python3 03_to_text.py                        # -> mimic-iii-sents.txt
 cd ..
 ./train mimic-iii/mimic-iii-sents.txt model.bin
 ```
@@ -479,24 +513,27 @@ ft.print_projection_block_norms()
 
 ```
 .
-├── fasttext_context.h      # Core class definition
-├── fasttext_context.cpp    # Training orchestration & inference dispatch
-├── types.h                 # GroupedSample, HuffmanNode, constants
-├── matrix.h                # Matrix class with mulVec/mulVecTranspose/addOuterProduct
-├── vocabulary.h/cpp        # Three-group vocabulary (word/patient/provider)
-├── trainer.h/cpp           # Training loop, hybrid SGD, projection backward pass
-├── inference.h/cpp         # Concat+projection composition & NN search
-├── train.cpp               # CLI: training
-├── query.cpp               # CLI: nearest-neighbor queries
-├── compare.cpp             # CLI: vector comparison
-├── fasttext_context.py     # Python loader (numpy only)
-├── generate_demo_sentences.py   # Synthetic training data generator (triple-pipe format)
+├── fasttext_context.h         # Core class definition
+├── fasttext_context.cpp       # Training orchestration & inference dispatch
+├── types.h                    # GroupedSample, HuffmanNode, constants
+├── matrix.h                   # Matrix class with mulVec/mulVecTranspose/addOuterProduct
+├── vocabulary.h/cpp           # Three-group vocabulary (word/patient/provider)
+├── trainer.h/cpp              # Training loop, hybrid SGD, projection backward pass
+├── inference.h/cpp            # Concat+projection composition & NN search
+├── train.cpp                  # CLI: training
+├── query.cpp                  # CLI: nearest-neighbor queries
+├── compare.cpp                # CLI: vector comparison
+├── fasttext_context.py        # Python loader (numpy only)
+├── generate_demo_sentences.py # Synthetic training data generator (triple-pipe format)
+├── run_bootstrap.sh           # Train original model + N bootstrap replicates
+├── compare_bootstrap.py       # 95% CIs on similarity via the bootstrap ensemble
+├── dump_metadata.py           # Export patient/provider vocabularies to text files
 ├── Makefile
 ├── mimic-iii/
-│   ├── 01_merge.py         # Step 1: join source tables → merged parquet
-│   ├── 02_to_sentences.py  # Step 2: NLP sentence segmentation → sentences parquet
-│   ├── 03_to_text.py       # Step 3: explode & shuffle → triple-pipe training text
-│   └── requirements.txt    # Python dependencies for preprocessing
+│   ├── 01_merge.py            # Step 1: join source tables -> merged parquet
+│   ├── 02_to_sentences.py     # Step 2: NLP sentence segmentation -> sentences parquet
+│   ├── 03_to_text.py          # Step 3: explode & shuffle -> triple-pipe training text
+│   └── requirements.txt       # Python dependencies for preprocessing
 └── README.md
 ```
 
