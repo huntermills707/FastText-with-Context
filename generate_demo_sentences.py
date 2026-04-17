@@ -82,17 +82,17 @@ def generate_training_file(filename: str = "training_data_with_context.txt",
                 random.choice(marital_statuses),
                 random.choice(insurances),
             ]
-            patient_fields = random.sample(all_patient_fields, min(n_patient, len(all_patient_fields)))
-            patient_str = " ".join(patient_fields)
+            patient_group = random.sample(all_patient_fields, min(n_patient, len(all_patient_fields)))
+            patient_str = " ".join(patient_group)
 
-            # Provider group fields (may be empty).
-            n_provider = random.randint(0, 2)
-            all_provider_fields = [
+            # Encounter group fields (may be empty).
+            n_encounter = random.randint(0, 2)
+            all_encounter_fields = [
                 random.choice(caregiver_titles),
                 random.choice(admission_types),
             ]
-            provider_fields = random.sample(all_provider_fields, min(n_provider, len(all_provider_fields)))
-            provider_str = " ".join(provider_fields)
+            encounter_group = random.sample(all_encounter_fields, min(n_encounter, len(all_encounter_fields)))
+            encounter_str = " ".join(encounter_group)
 
             # Sentence from template.
             template = random.choice(templates)
@@ -110,8 +110,8 @@ def generate_training_file(filename: str = "training_data_with_context.txt",
                 lab_finding=random.choice(lab_findings),
             )
 
-            # Format: <PatientGroup> ||| <ProviderGroup> ||| <Words>
-            row = f"{patient_str} ||| {provider_str} ||| {sentence}"
+            # Format: <PatientGroup> ||| <EncounterGroup> ||| <Words>
+            row = f"{patient_str} ||| {encounter_str} ||| {sentence}"
             f.write(row + "\n")
 
     print(f"Generated {num_rows} rows in '{filename}'")

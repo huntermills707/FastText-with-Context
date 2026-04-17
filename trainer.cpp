@@ -12,12 +12,12 @@
 
 namespace fasttext {
 
-Trainer::Trainer(int d_w, int d_p, int d_pr, int d_out,
+Trainer::Trainer(int d_word, int d_patient, int d_encounter, int d_out,
                  int epoch, float lr, int min_n, int max_n,
                  int chunk_size, int ngram_buckets, int window_size,
                  float grad_clip, float weight_decay)
-    : d_w_(d_w), d_p_(d_p), d_pr_(d_pr), d_out_(d_out),
-      concat_dim_(d_w + d_p + d_pr),
+    : d_word_(d_word), d_patient_(d_patient), d_encounter_(d_encounter), d_out_(d_out),
+      concat_dim_(d_word + d_patient + d_encounter),
       epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
       chunk_size_(chunk_size), ngram_buckets_(ngram_buckets),
       window_size_(window_size), grad_clip_(grad_clip), weight_decay_(weight_decay) {
@@ -26,7 +26,7 @@ Trainer::Trainer(int d_w, int d_p, int d_pr, int d_out,
     for (int i = 0; i < T; ++i) rngs_[i].seed(std::random_device{}() + i);
 
     thread_bufs_.resize(T);
-    for (auto& buf : thread_bufs_) buf.resize(d_w, d_p, d_pr, d_out);
+    for (auto& buf : thread_bufs_) buf.resize(d_word, d_patient, d_encounter, d_out);
 }
 
 void Trainer::clipNorm(std::vector<float>& v, float max_norm) {
@@ -55,14 +55,14 @@ void Trainer::getNgramIndices(const std::string& word, std::vector<int>& out) co
 }
 
 bool Trainer::parseGroupedLine(const std::string& line, GroupedSample& sample) const {
-    sample.patient_fields.clear();
-    sample.provider_fields.clear();
+    sample.patient_group.clear();
+    sample.encounter_group.clear();
     sample.words.clear();
 
     if (line.empty()) return false;
 
     // Split on " ||| " (space-pipe-pipe-pipe-space).
-    // Expect exactly 3 groups: patient, provider, words.
+    // Expect exactly 3 groups: patient_group, encounter_group, words.
     std::vector<std::string> groups;
     size_t start = 0;
     const std::string delim = " ||| ";
@@ -82,11 +82,11 @@ bool Trainer::parseGroupedLine(const std::string& line, GroupedSample& sample) c
 
     // Patient group (index 0).
     std::istringstream ps(groups[0]);
-    while (ps >> token) sample.patient_fields.push_back(token);
+    while (ps >> token) sample.patient_group.push_back(token);
 
-    // Provider group (index 1).
+    // Encounter group (index 1).
     std::istringstream prs(groups[1]);
-    while (prs >> token) sample.provider_fields.push_back(token);
+    while (prs >> token) sample.encounter_group.push_back(token);
 
     // Words group (index 2, always last).
     std::istringstream ws(groups[2]);
@@ -128,21 +128,21 @@ bool Trainer::checkMatrixHealth(const Matrix& m, const std::string& name, int ep
 
 void Trainer::broadcastDenseParams(const Matrix& W_proj,
                                    const Matrix& patient_matrix,
-                                   const Matrix& provider_matrix) {
+                                   const Matrix& encounter_matrix) {
     int T = omp_get_max_threads();
     for (int t = 0; t < T; ++t) {
         std::memcpy(W_proj_local_[t].data(), W_proj.data(),
                     static_cast<size_t>(W_proj.size()) * sizeof(float));
         std::memcpy(patient_local_[t].data(), patient_matrix.data(),
                     static_cast<size_t>(patient_matrix.size()) * sizeof(float));
-        std::memcpy(provider_local_[t].data(), provider_matrix.data(),
-                    static_cast<size_t>(provider_matrix.size()) * sizeof(float));
+        std::memcpy(encounter_local_[t].data(), encounter_matrix.data(),
+                    static_cast<size_t>(encounter_matrix.size()) * sizeof(float));
     }
 }
 
 void Trainer::reduceDenseParams(Matrix& W_proj,
                                 Matrix& patient_matrix,
-                                Matrix& provider_matrix) {
+                                Matrix& encounter_matrix) {
     int T = omp_get_max_threads();
     float inv_T = 1.0f / static_cast<float>(T);
 
@@ -157,7 +157,7 @@ void Trainer::reduceDenseParams(Matrix& W_proj,
 
     average(W_proj, W_proj_local_);
     average(patient_matrix, patient_local_);
-    average(provider_matrix, provider_local_);
+    average(encounter_matrix, encounter_local_);
 
     // L2 weight decay on W_proj only (not on embedding matrices).
     // Applied after each chunk reduce: W_proj *= (1 - weight_decay).
@@ -175,50 +175,50 @@ void Trainer::buildConcatVec(int word_idx, const std::string& word,
                               const Matrix& input_matrix,
                               const Matrix& ngram_matrix,
                               const Matrix& patient_matrix,
-                              const Matrix& provider_matrix,
+                              const Matrix& encounter_matrix,
                               std::vector<float>& concat_out,
                               std::vector<int>& ngram_out) const {
     std::fill(concat_out.begin(), concat_out.end(), 0.0f);
 
-    // Word part: concat_out[0..d_w).
+    // Word part: concat_out[0..d_word_).
     float* wp = concat_out.data();
     const float* wr = input_matrix.row(word_idx);
-    for (int j = 0; j < d_w_; ++j) wp[j] += wr[j];
+    for (int j = 0; j < d_word_; ++j) wp[j] += wr[j];
 
     getNgramIndices(word, ngram_out);
     for (int idx : ngram_out) {
         const float* nr = ngram_matrix.row(idx);
-        for (int j = 0; j < d_w_; ++j) wp[j] += nr[j];
+        for (int j = 0; j < d_word_; ++j) wp[j] += nr[j];
     }
 
-    // Patient part: concat_out[d_w..d_w+d_p).
-    float* pp = concat_out.data() + d_w_;
+    // Patient part: concat_out[d_word_..d_word_+d_patient_).
+    float* pp = concat_out.data() + d_word_;
     int n_patient = 0;
-    for (const auto& field : sample.patient_fields) {
+    for (const auto& field : sample.patient_group) {
         int idx = vocab.getPatientIdx(field);
         if (idx < 0) continue;
         const float* pr = patient_matrix.row(idx);
-        for (int j = 0; j < d_p_; ++j) pp[j] += pr[j];
+        for (int j = 0; j < d_patient_; ++j) pp[j] += pr[j];
         ++n_patient;
     }
     if (n_patient > 1) {
         float inv = 1.0f / static_cast<float>(n_patient);
-        for (int j = 0; j < d_p_; ++j) pp[j] *= inv;
+        for (int j = 0; j < d_patient_; ++j) pp[j] *= inv;
     }
 
-    // Provider part: concat_out[d_w+d_p..concat_dim).
-    float* prp = concat_out.data() + d_w_ + d_p_;
-    int n_provider = 0;
-    for (const auto& field : sample.provider_fields) {
-        int idx = vocab.getProviderIdx(field);
+    // Encounter part: concat_out[d_word_+d_patient_..concat_dim).
+    float* encp = concat_out.data() + d_word_ + d_patient_;
+    int n_encounter = 0;
+    for (const auto& field : sample.encounter_group) {
+        int idx = vocab.getEncounterIdx(field);
         if (idx < 0) continue;
-        const float* pr = provider_matrix.row(idx);
-        for (int j = 0; j < d_pr_; ++j) prp[j] += pr[j];
-        ++n_provider;
+        const float* pr = encounter_matrix.row(idx);
+        for (int j = 0; j < d_encounter_; ++j) encp[j] += pr[j];
+        ++n_encounter;
     }
-    if (n_provider > 1) {
-        float inv = 1.0f / static_cast<float>(n_provider);
-        for (int j = 0; j < d_pr_; ++j) prp[j] *= inv;
+    if (n_encounter > 1) {
+        float inv = 1.0f / static_cast<float>(n_encounter);
+        for (int j = 0; j < d_encounter_; ++j) encp[j] *= inv;
     }
 }
 
@@ -262,9 +262,9 @@ float Trainer::hsStep(int node_idx, int direction,
 //   W_proj     += lr * center_grad * concat^T   [step 6b, thread-local]
 //
 // Then distributes concat_grad slices:
-//   word_grad     = concat_grad[0..d_w)          → input_matrix, ngram_matrix (Hogwild)
-//   patient_grad  = concat_grad[d_w..d_w+d_p)    → patient_matrix (thread-local)
-//   provider_grad = concat_grad[d_w+d_p..end)     → provider_matrix (thread-local)
+//   word_grad     = concat_grad[0..d_word_)         → input_matrix, ngram_matrix (Hogwild)
+//   patient_grad  = concat_grad[d_word_..d_word_+d_patient_)    → patient_matrix (thread-local)
+//   encounter_grad = concat_grad[d_word_+d_patient_..end)     → encounter_matrix (thread-local)
 void Trainer::distributeGrad(const std::vector<float>& concat_grad,
                               const std::vector<float>& center_grad,
                               const std::vector<float>& concat_vec,
@@ -276,55 +276,55 @@ void Trainer::distributeGrad(const std::vector<float>& concat_grad,
                               Matrix& ngram_matrix,
                               Matrix& W_proj,
                               Matrix& patient_matrix,
-                              Matrix& provider_matrix,
+                              Matrix& encounter_matrix,
                               float lr) {
     // Update W_proj (thread-local): W_proj += lr * center_grad * concat^T.
     W_proj.addOuterProduct(center_grad.data(), concat_vec.data(), lr);
 
-    // Word part [0..d_w): Hogwild writes to shared input/ngram matrices.
+    // Word part [0..d_word_): Hogwild writes to shared input/ngram matrices.
     const float* word_grad = concat_grad.data();
 
     float* wr = input_matrix.row(word_idx);
-    for (int j = 0; j < d_w_; ++j)
+    for (int j = 0; j < d_word_; ++j)
         wr[j] += lr * word_grad[j];
 
     for (int idx : ngram_indices) {
         float* nr = ngram_matrix.row(idx);
-        for (int j = 0; j < d_w_; ++j)
+        for (int j = 0; j < d_word_; ++j)
             nr[j] += lr * word_grad[j];
     }
 
-    // Patient part [d_w..d_w+d_p): write to thread-local patient_matrix.
-    const float* patient_grad = concat_grad.data() + d_w_;
+    // Patient part [d_word_..d_word_+d_patient_): write to thread-local patient_matrix.
+    const float* patient_grad = concat_grad.data() + d_word_;
     int n_patient = 0;
-    for (const auto& field : sample.patient_fields)
+    for (const auto& field : sample.patient_group)
         if (vocab.getPatientIdx(field) >= 0) ++n_patient;
 
     if (n_patient > 0) {
         float patient_scale = lr / static_cast<float>(n_patient);
-        for (const auto& field : sample.patient_fields) {
+        for (const auto& field : sample.patient_group) {
             int idx = vocab.getPatientIdx(field);
             if (idx < 0) continue;
             float* pr = patient_matrix.row(idx);
-            for (int j = 0; j < d_p_; ++j)
+            for (int j = 0; j < d_patient_; ++j)
                 pr[j] += patient_scale * patient_grad[j];
         }
     }
 
-    // Provider part [d_w+d_p..concat_dim): write to thread-local provider_matrix.
-    const float* provider_grad = concat_grad.data() + d_w_ + d_p_;
-    int n_provider = 0;
-    for (const auto& field : sample.provider_fields)
-        if (vocab.getProviderIdx(field) >= 0) ++n_provider;
+    // Encounter part [d_word_+d_patient_..concat_dim): write to thread-local encounter_matrix.
+    const float* encounter_grad = concat_grad.data() + d_word_ + d_patient_;
+    int n_encounter = 0;
+    for (const auto& field : sample.encounter_group)
+        if (vocab.getEncounterIdx(field) >= 0) ++n_encounter;
 
-    if (n_provider > 0) {
-        float provider_scale = lr / static_cast<float>(n_provider);
-        for (const auto& field : sample.provider_fields) {
-            int idx = vocab.getProviderIdx(field);
+    if (n_encounter > 0) {
+        float encounter_scale = lr / static_cast<float>(n_encounter);
+        for (const auto& field : sample.encounter_group) {
+            int idx = vocab.getEncounterIdx(field);
             if (idx < 0) continue;
-            float* pr = provider_matrix.row(idx);
-            for (int j = 0; j < d_pr_; ++j)
-                pr[j] += provider_scale * provider_grad[j];
+            float* pr = encounter_matrix.row(idx);
+            for (int j = 0; j < d_encounter_; ++j)
+                pr[j] += encounter_scale * encounter_grad[j];
         }
     }
 }
@@ -335,7 +335,7 @@ void Trainer::processSample(const GroupedSample& sample,
                             Matrix& ngram_matrix,
                             Matrix& W_proj,
                             Matrix& patient_matrix,
-                            Matrix& provider_matrix,
+                            Matrix& encounter_matrix,
                             float lr, int tid,
                             double& loss_acc, long long& pred_count) {
     std::uniform_real_distribution<float> ud(0.0f, 1.0f);
@@ -349,10 +349,10 @@ void Trainer::processSample(const GroupedSample& sample,
         if (!vocab.discard_probs_.empty() && vocab.discard_probs_[cw_idx] > 0.0f)
             if (ud(rngs_[tid]) < vocab.discard_probs_[cw_idx]) continue;
 
-        // 1. Build concat_vec = [word_part ; patient_avg ; provider_avg].
+        // 1. Build concat_vec = [word_part ; patient_avg ; encounter_avg].
         buildConcatVec(cw_idx, sample.words[cp], sample, vocab,
                        input_matrix, ngram_matrix,
-                       patient_matrix, provider_matrix,
+                       patient_matrix, encounter_matrix,
                        buf.concat_vec, buf.ngram_indices);
 
         // 2. Project to d_out: center_vec = W_proj * concat_vec.
@@ -398,7 +398,7 @@ void Trainer::processSample(const GroupedSample& sample,
         distributeGrad(buf.concat_grad, buf.center_grad, buf.concat_vec,
                        cw_idx, buf.ngram_indices, sample, vocab,
                        input_matrix, ngram_matrix,
-                       W_proj, patient_matrix, provider_matrix,
+                       W_proj, patient_matrix, encounter_matrix,
                        lr);
     }
 }
@@ -409,10 +409,10 @@ void Trainer::processChunk(const std::vector<GroupedSample>& chunk,
                            Matrix& ngram_matrix,
                            Matrix& W_proj,
                            Matrix& patient_matrix,
-                           Matrix& provider_matrix,
+                           Matrix& encounter_matrix,
                            float lr, double& loss_acc, long long& pred_count) {
     // BROADCAST: shared → thread-local.
-    broadcastDenseParams(W_proj, patient_matrix, provider_matrix);
+    broadcastDenseParams(W_proj, patient_matrix, encounter_matrix);
 
     // PROCESS: parallel over samples, each thread uses its own local copies.
     #pragma omp parallel for schedule(dynamic)
@@ -422,13 +422,13 @@ void Trainer::processChunk(const std::vector<GroupedSample>& chunk,
                       input_matrix, output_matrix, ngram_matrix,
                       W_proj_local_[tid],
                       patient_local_[tid],
-                      provider_local_[tid],
+                      encounter_local_[tid],
                       lr, tid, loss_acc, pred_count);
     }
     // Implicit barrier at end of #pragma omp parallel for.
 
     // REDUCE: average thread-local → shared dense params.
-    reduceDenseParams(W_proj, patient_matrix, provider_matrix);
+    reduceDenseParams(W_proj, patient_matrix, encounter_matrix);
 }
 
 void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
@@ -436,7 +436,7 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
                        Vocabulary& vocab,
                        Matrix& input_matrix, Matrix& output_matrix,
                        Matrix& ngram_matrix,
-                       Matrix& W_proj, Matrix& patient_matrix, Matrix& provider_matrix) {
+                       Matrix& W_proj, Matrix& patient_matrix, Matrix& encounter_matrix) {
     std::ifstream file(filename);
     if (!file.is_open()) throw std::runtime_error("Cannot open: " + filename);
 
@@ -456,7 +456,7 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
     auto flushChunk = [&]() {
         float lr = std::max(LR_FLOOR, lr_ * (1.0f - static_cast<float>(global_step) / total_steps));
         processChunk(chunk, vocab, input_matrix, output_matrix, ngram_matrix,
-                     W_proj, patient_matrix, provider_matrix,
+                     W_proj, patient_matrix, encounter_matrix,
                      lr, epoch_loss, epoch_preds);
         global_step += static_cast<long long>(chunk.size());
         processed   += static_cast<int>(chunk.size());
@@ -503,7 +503,7 @@ void Trainer::runEpoch(int ep, int total_samples, long long& global_step,
 void Trainer::train(const std::string& filename, Vocabulary& vocab,
                     Matrix& input_matrix, Matrix& output_matrix,
                     Matrix& ngram_matrix,
-                    Matrix& W_proj, Matrix& patient_matrix, Matrix& provider_matrix) {
+                    Matrix& W_proj, Matrix& patient_matrix, Matrix& encounter_matrix) {
     const int       total_samples = countLines(filename);
     const long long total_steps   = static_cast<long long>(total_samples) * epoch_;
     long long       global_step   = 0;
@@ -513,11 +513,11 @@ void Trainer::train(const std::string& filename, Vocabulary& vocab,
     // Initialize thread-local dense parameter copies.
     W_proj_local_.resize(T);
     patient_local_.resize(T);
-    provider_local_.resize(T);
+    encounter_local_.resize(T);
     for (int t = 0; t < T; ++t) {
         W_proj_local_[t].resize(W_proj.rows(), W_proj.cols());
         patient_local_[t].resize(patient_matrix.rows(), patient_matrix.cols());
-        provider_local_[t].resize(provider_matrix.rows(), provider_matrix.cols());
+        encounter_local_[t].resize(encounter_matrix.rows(), encounter_matrix.cols());
     }
 
     std::cout << "Samples: " << total_samples << " | Steps: " << total_steps
@@ -525,10 +525,10 @@ void Trainer::train(const std::string& filename, Vocabulary& vocab,
               << " | Window: [1," << window_size_ << "] (sampled)\n"
               << "Subsampling: " << (!vocab.discard_probs_.empty() ? "enabled" : "disabled")
               << " | Sparse updates: Hogwild (input, ngram, output)"
-              << " | Dense sync: chunk-averaged (W_proj, patient, provider)"
+              << " | Dense sync: chunk-averaged (W_proj, patient, encounter)"
               << " | Chunk size: " << chunk_size_
               << " | Grad clip: " << (grad_clip_ > 0.0f ? std::to_string(grad_clip_) : "off") << " | W_proj decay: " << (weight_decay_ > 0.0f ? std::to_string(weight_decay_) : "off")
-              << "\nDimensions: d_w=" << d_w_ << " d_p=" << d_p_ << " d_pr=" << d_pr_
+              << "\nDimensions: d_word=" << d_word_ << " d_patient=" << d_patient_ << " d_encounter=" << d_encounter_
               << " d_out=" << d_out_ << " concat=" << concat_dim_
               << " W_proj=" << W_proj.rows() << "x" << W_proj.cols()
               << "\n";
@@ -536,12 +536,12 @@ void Trainer::train(const std::string& filename, Vocabulary& vocab,
     for (int ep = 0; ep < epoch_; ++ep) {
         runEpoch(ep, total_samples, global_step, total_steps, filename, vocab,
                  input_matrix, output_matrix, ngram_matrix,
-                 W_proj, patient_matrix, provider_matrix);
+                 W_proj, patient_matrix, encounter_matrix);
 
         bool healthy = checkMatrixHealth(output_matrix,   "output",   ep + 1)
                     && checkMatrixHealth(ngram_matrix,     "ngram",    ep + 1)
                     && checkMatrixHealth(patient_matrix,   "patient",  ep + 1)
-                    && checkMatrixHealth(provider_matrix,  "provider", ep + 1)
+                    && checkMatrixHealth(encounter_matrix, "encounter", ep + 1)
                     && checkMatrixHealth(input_matrix,     "input",    ep + 1)
                     && checkMatrixHealth(W_proj,           "W_proj",   ep + 1);
         if (!healthy) throw std::runtime_error("Training aborted: matrix corruption.");

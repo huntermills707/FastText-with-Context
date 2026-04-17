@@ -8,7 +8,7 @@ void printUsage(const char* prog) {
               << "Dimension options:\n"
               << "  -d-word <int>         Word + n-gram embedding dimension (default: 150)\n"
               << "  -d-patient <int>      Patient group embedding dimension (default: 30)\n"
-              << "  -d-provider <int>     Provider group embedding dimension (default: 15)\n"
+              << "  -d-encounter <int>    Encounter group embedding dimension (default: 15)\n"
               << "  -d-out <int>          Output/projected dimension for HS (default: 150)\n\n"
               << "Training options:\n"
               << "  -epoch <int>          Number of training epochs (default: 5)\n"
@@ -24,14 +24,14 @@ void printUsage(const char* prog) {
               << "  -ngram-buckets <int>  N-gram hash buckets (default: 2000000)\n"
               << "  -window-size <int>    Max skip-gram window size (default: 5)\n"
               << "  -help                 Show this help message\n\n"
-              << "Data format: <PatientGroup> ||| <ProviderGroup> ||| <WordsGroup>\n"
+              << "Data format: <PatientGroup> ||| <EncounterGroup> ||| <WordsGroup>\n"
               << "  Elements within each group are space-delimited.\n"
               << "  Groups may be empty (delimiters still required).\n"
               << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-    int   d_w = 150, d_p = 30, d_pr = 15, d_out = 150;
+    int   d_word = 150, d_patient = 30, d_encounter = 15, d_out = 150;
     int   epoch = 5, min_n = 3, max_n = 8;
     int   threshold = 5, threads = omp_get_max_threads();
     int   chunk_size = 1000, ngram_buckets = 2000000, window_size = 5;
@@ -41,9 +41,9 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-help" || arg == "--help") { printUsage(argv[0]); return 0; }
-        else if (arg == "-d-word"       && i+1 < argc) d_w           = std::stoi(argv[++i]);
-        else if (arg == "-d-patient"    && i+1 < argc) d_p           = std::stoi(argv[++i]);
-        else if (arg == "-d-provider"   && i+1 < argc) d_pr          = std::stoi(argv[++i]);
+        else if (arg == "-d-word"       && i+1 < argc) d_word        = std::stoi(argv[++i]);
+        else if (arg == "-d-patient"    && i+1 < argc) d_patient     = std::stoi(argv[++i]);
+        else if (arg == "-d-encounter"  && i+1 < argc) d_encounter   = std::stoi(argv[++i]);
         else if (arg == "-d-out"        && i+1 < argc) d_out         = std::stoi(argv[++i]);
         else if (arg == "-epoch"        && i+1 < argc) epoch         = std::stoi(argv[++i]);
         else if (arg == "-lr"           && i+1 < argc) lr            = std::stof(argv[++i]);
@@ -74,12 +74,12 @@ int main(int argc, char* argv[]) {
     std::cout << "=== FastTextContext Training (Concat+Projection) ===\n"
               << "  Input:             " << inputFile       << "\n"
               << "  Output:            " << outputFile      << "\n"
-              << "  d_word:            " << d_w             << "\n"
-              << "  d_patient:         " << d_p             << "\n"
-              << "  d_provider:        " << d_pr            << "\n"
+              << "  d_word:            " << d_word          << "\n"
+              << "  d_patient:         " << d_patient       << "\n"
+              << "  d_encounter:       " << d_encounter     << "\n"
               << "  d_out:             " << d_out           << "\n"
-              << "  concat_dim:        " << (d_w + d_p + d_pr) << "\n"
-              << "  W_proj shape:      " << d_out << " x " << (d_w + d_p + d_pr) << "\n"
+              << "  concat_dim:        " << (d_word + d_patient + d_encounter) << "\n"
+              << "  W_proj shape:      " << d_out << " x " << (d_word + d_patient + d_encounter) << "\n"
               << "  Epochs:            " << epoch           << "\n"
               << "  LR:                " << lr              << "\n"
               << "  N-grams:           " << min_n << "-" << max_n << "\n"
@@ -91,12 +91,12 @@ int main(int argc, char* argv[]) {
               << "  Chunk size:        " << chunk_size      << "\n"
               << "  N-gram buckets:    " << ngram_buckets   << "\n"
               << "  Sparse updates:    Hogwild (input, ngram, output)\n"
-              << "  Dense sync:        chunk-averaged (W_proj, patient, provider)\n"
+              << "  Dense sync:        chunk-averaged (W_proj, patient, encounter)\n"
               << "  W_proj decay:      " << (weight_decay > 0.0f ? std::to_string(weight_decay) : "off") << "\n"
-              << "  Data format:       <PatientGroup> ||| <ProviderGroup> ||| <Words>\n\n";
+              << "  Data format:       <PatientGroup> ||| <EncounterGroup> ||| <Words>\n\n";
 
     try {
-        fasttext::FastTextContext ft(d_w, d_p, d_pr, d_out,
+        fasttext::FastTextContext ft(d_word, d_patient, d_encounter, d_out,
                                      epoch, lr, min_n, max_n, threshold,
                                      chunk_size, ngram_buckets, window_size,
                                      subsample_t, grad_clip, weight_decay);

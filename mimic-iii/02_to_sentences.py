@@ -7,10 +7,10 @@ Reads:
 Writes:
     mimic-iii-sents.parquet   -- one row per note, columns:
                                   SUBJECT_ID, ROW_ID,
-                                  PatientGroup, ProviderGroup,
+                                  patient_group, encounter_group,
                                   Sentences (List[str])
 
-    PatientGroup / ProviderGroup are pre-computed context strings used by
+    patient_group / encounter_group are pre-computed context strings used by
     03_to_text.py when writing the final training file.  Sentences have already
     been cleaned, de-identified tag-stripped, lowercased, digit-filtered, and
     filtered to --min-len characters, so 03_to_text.py can explode and write
@@ -50,11 +50,11 @@ nltk.download('punkt_tab', quiet=True)
 # Column definitions (must match 01_merge.py output).
 # ------------------------------------------------------------------
 PATIENT_COLS = [
-    'MeSH', 'GENDER', 'ETHNICITY', 'LANGUAGE',
-    'RELIGION', 'MARITAL_STATUS', 'INSURANCE',
+    'age_group', 'gender', 'ethnicity', 'language',
+    'religion', 'marital_status', 'insurance',
 ]
-PROVIDER_COLS = [
-    'CG_TITLE', 'ADMISSION_TYPE', 'LOS', 'DEATH'
+ENCOUNTER_COLS = [
+    'caregiver_role', 'admission_type', 'length_of_stay', 'mortality'
 ]
 
 # ------------------------------------------------------------------
@@ -126,8 +126,8 @@ def _group_str(row: dict, cols: list) -> str:
 OUTPUT_SCHEMA = pa.schema([
     pa.field('SUBJECT_ID',    pa.int64()),
     pa.field('ROW_ID',        pa.int64()),
-    pa.field('PatientGroup',  pa.string()),
-    pa.field('ProviderGroup', pa.string()),
+    pa.field('patient_group',  pa.string()),
+    pa.field('encounter_group', pa.string()),
     pa.field('Sentences',     pa.list_(pa.string())),
 ])
 
@@ -141,11 +141,11 @@ def process_batch(batch: pl.DataFrame, pool: Pool) -> pa.Table:
     texts          = batch['TEXT'].to_list()
     sentence_lists = list(pool.imap(process_text, texts, chunksize=256))
 
-    all_cols      = PATIENT_COLS + PROVIDER_COLS
+    all_cols      = PATIENT_COLS + ENCOUNTER_COLS
     subject_ids   = []
     row_ids       = []
     patient_groups  = []
-    provider_groups = []
+    encounter_groups = []
     sentences_col   = []
 
     for i, sentences in enumerate(sentence_lists):
@@ -155,16 +155,16 @@ def process_batch(batch: pl.DataFrame, pool: Pool) -> pa.Table:
         subject_ids.append(batch['SUBJECT_ID'][i])
         row_ids.append(batch['ROW_ID'][i])
         patient_groups.append(_group_str(row, PATIENT_COLS))
-        provider_groups.append(_group_str(row, PROVIDER_COLS))
+        encounter_groups.append(_group_str(row, ENCOUNTER_COLS))
         sentences_col.append(sentences)
 
     return pa.table(
         {
-            'SUBJECT_ID':    pa.array(subject_ids,    type=pa.int64()),
-            'ROW_ID':        pa.array(row_ids,        type=pa.int64()),
-            'PatientGroup':  pa.array(patient_groups, type=pa.string()),
-            'ProviderGroup': pa.array(provider_groups, type=pa.string()),
-            'Sentences':     pa.array(sentences_col,  type=pa.list_(pa.string())),
+            'SUBJECT_ID':      pa.array(subject_ids,      type=pa.int64()),
+            'ROW_ID':          pa.array(row_ids,          type=pa.int64()),
+            'patient_group':   pa.array(patient_groups,   type=pa.string()),
+            'encounter_group': pa.array(encounter_groups, type=pa.string()),
+            'Sentences':       pa.array(sentences_col,    type=pa.list_(pa.string())),
         },
         schema=OUTPUT_SCHEMA,
     )

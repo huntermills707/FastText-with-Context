@@ -13,17 +13,17 @@ Inference::Inference(const Vocabulary& vocab,
                      const Matrix& ngram_matrix,
                      const Matrix& W_proj,
                      const Matrix& patient_matrix,
-                     const Matrix& provider_matrix,
-                     int d_w, int d_p, int d_pr, int d_out,
+                     const Matrix& encounter_matrix,
+                     int d_word, int d_patient, int d_encounter, int d_out,
                      int min_n, int max_n)
     : vocab_(vocab),
       input_matrix_(input_matrix),
       ngram_matrix_(ngram_matrix),
       W_proj_(W_proj),
       patient_matrix_(patient_matrix),
-      provider_matrix_(provider_matrix),
-      d_w_(d_w), d_p_(d_p), d_pr_(d_pr), d_out_(d_out),
-      concat_dim_(d_w + d_p + d_pr),
+      encounter_matrix_(encounter_matrix),
+      d_word_(d_word), d_patient_(d_patient), d_encounter_(d_encounter), d_out_(d_out),
+      concat_dim_(d_word + d_patient + d_encounter),
       min_n_(min_n), max_n_(max_n) {}
 
 uint64_t Inference::hash(const std::string& str) const {
@@ -44,32 +44,32 @@ std::vector<int> Inference::getNgramIndices(const std::string& word) const {
     return indices;
 }
 
-// word_embedding (if in vocab) + sum(ngram_embeddings). Dimension: d_w.
+// word_embedding (if in vocab) + sum(ngram_embeddings). Dimension: d_word.
 // OOV words fall back to ngrams only.
 std::vector<float> Inference::getWordVector(const std::string& word) const {
-    std::vector<float> vec(d_w_, 0.0f);
+    std::vector<float> vec(d_word_, 0.0f);
 
     int word_idx = vocab_.getWordIdx(word);
     if (word_idx >= 0) {
         const float* wr = input_matrix_.row(word_idx);
-        for (int j = 0; j < d_w_; ++j) vec[j] += wr[j];
+        for (int j = 0; j < d_word_; ++j) vec[j] += wr[j];
     }
 
     for (int idx : getNgramIndices(word)) {
         const float* nr = ngram_matrix_.row(idx);
-        for (int j = 0; j < d_w_; ++j) vec[j] += nr[j];
+        for (int j = 0; j < d_word_; ++j) vec[j] += nr[j];
     }
 
     return vec;
 }
 
-// Project a word-only vector (patient/provider regions zeroed) through W_proj.
+// Project a word-only vector (patient/encounter regions zeroed) through W_proj.
 // Returns d_out-dimensional vector, not L2-normalised.
 std::vector<float> Inference::getProjectedWordVector(const std::string& word) const {
     std::vector<float> concat(concat_dim_, 0.0f);
     std::vector<float> wv = getWordVector(word);
     std::copy(wv.begin(), wv.end(), concat.begin());
-    // Patient and provider regions remain zero.
+    // Patient and encounter regions remain zero.
 
     std::vector<float> projected(d_out_);
     W_proj_.mulVec(concat.data(), projected.data());
@@ -77,15 +77,15 @@ std::vector<float> Inference::getProjectedWordVector(const std::string& word) co
 }
 
 // Concatenation-with-projection composition:
-//   word_part = avg(word_emb_i + sum(ngrams_i))   [d_w]
-//   patient_part = avg(patient_emb_i)              [d_p]  (zero if empty)
-//   provider_part = avg(provider_emb_i)            [d_pr] (zero if empty)
-//   concat = [word_part ; patient_part ; provider_part]  [concat_dim]
+//   word_part = avg(word_emb_i + sum(ngrams_i))   [d_word]
+//   patient_part = avg(patient_emb_i)              [d_patient]  (zero if empty)
+//   encounter_part = avg(encounter_emb_i)            [d_encounter] (zero if empty)
+//   concat = [word_part ; patient_part ; encounter_part]  [concat_dim]
 //   result = L2_normalise(W_proj * concat)         [d_out]
 std::vector<float> Inference::getCombinedVector(
     const std::vector<std::string>& words,
-    const std::vector<std::string>& patient_meta,
-    const std::vector<std::string>& provider_meta) const {
+    const std::vector<std::string>& patient_group,
+    const std::vector<std::string>& encounter_group) const {
 
     std::vector<float> concat(concat_dim_, 0.0f);
 
@@ -93,41 +93,41 @@ std::vector<float> Inference::getCombinedVector(
     float* wp = concat.data();
     for (const auto& w : words) {
         auto wv = getWordVector(w);
-        for (int j = 0; j < d_w_; ++j) wp[j] += wv[j];
+        for (int j = 0; j < d_word_; ++j) wp[j] += wv[j];
     }
     if (!words.empty()) {
         float inv = 1.0f / static_cast<float>(words.size());
-        for (int j = 0; j < d_w_; ++j) wp[j] *= inv;
+        for (int j = 0; j < d_word_; ++j) wp[j] *= inv;
     }
 
     // Patient part: avg of active patient embeddings.
-    float* pp = concat.data() + d_w_;
+    float* pp = concat.data() + d_word_;
     int np = 0;
-    for (const auto& field : patient_meta) {
+    for (const auto& field : patient_group) {
         int idx = vocab_.getPatientIdx(field);
         if (idx < 0) continue;
         const float* row = patient_matrix_.row(idx);
-        for (int j = 0; j < d_p_; ++j) pp[j] += row[j];
+        for (int j = 0; j < d_patient_; ++j) pp[j] += row[j];
         ++np;
     }
     if (np > 1) {
         float inv = 1.0f / static_cast<float>(np);
-        for (int j = 0; j < d_p_; ++j) pp[j] *= inv;
+        for (int j = 0; j < d_patient_; ++j) pp[j] *= inv;
     }
 
-    // Provider part: avg of active provider embeddings.
-    float* prp = concat.data() + d_w_ + d_p_;
-    int npr = 0;
-    for (const auto& field : provider_meta) {
-        int idx = vocab_.getProviderIdx(field);
+    // Encounter part: avg of active encounter embeddings.
+    float* encp = concat.data() + d_word_ + d_patient_;
+    int nenc = 0;
+    for (const auto& field : encounter_group) {
+        int idx = vocab_.getEncounterIdx(field);
         if (idx < 0) continue;
-        const float* row = provider_matrix_.row(idx);
-        for (int j = 0; j < d_pr_; ++j) prp[j] += row[j];
-        ++npr;
+        const float* row = encounter_matrix_.row(idx);
+        for (int j = 0; j < d_encounter_; ++j) encp[j] += row[j];
+        ++nenc;
     }
-    if (npr > 1) {
-        float inv = 1.0f / static_cast<float>(npr);
-        for (int j = 0; j < d_pr_; ++j) prp[j] *= inv;
+    if (nenc > 1) {
+        float inv = 1.0f / static_cast<float>(nenc);
+        for (int j = 0; j < d_encounter_; ++j) encp[j] *= inv;
     }
 
     // Project: d_out = W_proj * concat.
@@ -146,12 +146,12 @@ std::vector<float> Inference::getCombinedVector(
 
 std::vector<std::pair<std::string, float>> Inference::getNearestNeighbors(
     const std::vector<std::string>& words,
-    const std::vector<std::string>& patient_meta,
-    const std::vector<std::string>& provider_meta,
+    const std::vector<std::string>& patient_group,
+    const std::vector<std::string>& encounter_group,
     int k,
     const Matrix& cached_word_vectors) const {
 
-    std::vector<float> query = getCombinedVector(words, patient_meta, provider_meta);
+    std::vector<float> query = getCombinedVector(words, patient_group, encounter_group);
 
     float q_norm = 0.0f;
     for (float v : query) q_norm += v * v;

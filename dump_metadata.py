@@ -13,25 +13,23 @@ def main():
         print(f"Error loading model: {e}")
         sys.exit(1)
 
-    # Extracting patient metadata
-    # The entities are stored in idx2patient dictionary (mapping index to string)
+    # Extracting patient group metadata
     patient_entities = list(model.idx2patient.values())
-    # Sort for deterministic output
     patient_entities.sort()
 
-    with open('patient_metadata.txt', 'w', encoding='utf-8') as f:
+    with open('patient_fields.txt', 'w', encoding='utf-8') as f:
         for entity in patient_entities:
             f.write(f"{entity}\n")
-    print(f"Saved {len(patient_entities)} patient entities to patient_metadata.txt")
+    print(f"Saved {len(patient_entities)} patient group fields to patient_fields.txt")
 
-    # Extracting provider metadata
-    provider_entities = list(model.idx2provider.values())
-    provider_entities.sort()
+    # Extracting encounter group metadata
+    encounter_entities = list(model.idx2encounter.values())
+    encounter_entities.sort()
 
-    with open('provider_metadata.txt', 'w', encoding='utf-8') as f:
-        for entity in provider_entities:
+    with open('encounter_fields.txt', 'w', encoding='utf-8') as f:
+        for entity in encounter_entities:
             f.write(f"{entity}\n")
-    print(f"Saved {len(provider_entities)} provider entities to provider_metadata.txt")
+    print(f"Saved {len(encounter_entities)} encounter group fields to encounter_fields.txt")
 
 if __name__ == "__main__":
     main()

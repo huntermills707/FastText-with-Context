@@ -8,12 +8,12 @@
 
 namespace fasttext {
 
-FastTextContext::FastTextContext(int d_w, int d_p, int d_pr, int d_out,
+FastTextContext::FastTextContext(int d_word, int d_patient, int d_encounter, int d_out,
                                  int epoch, float lr,
                                  int min_n, int max_n, int threshold,
                                  int chunk_size, int ngram_buckets,
                                  int window_size, float subsample_t, float grad_clip, float weight_decay)
-    : d_w_(d_w), d_p_(d_p), d_pr_(d_pr), d_out_(d_out),
+    : d_word_(d_word), d_patient_(d_patient), d_encounter_(d_encounter), d_out_(d_out),
       epoch_(epoch), lr_(lr), min_n_(min_n), max_n_(max_n),
       threshold_(threshold), chunk_size_(chunk_size), ngram_buckets_(ngram_buckets),
       window_size_(window_size), subsample_t_(subsample_t), grad_clip_(grad_clip), weight_decay_(weight_decay) {}
@@ -21,23 +21,23 @@ FastTextContext::FastTextContext(int d_w, int d_p, int d_pr, int d_out,
 void FastTextContext::makeInference() {
     inference_ = std::make_unique<Inference>(
         vocab_, input_matrix_, ngram_matrix_,
-        W_proj_, patient_matrix_, provider_matrix_,
-        d_w_, d_p_, d_pr_, d_out_, min_n_, max_n_);
+        W_proj_, patient_matrix_, encounter_matrix_,
+        d_word_, d_patient_, d_encounter_, d_out_, min_n_, max_n_);
 }
 
 void FastTextContext::initializeMatrices() {
     const int V  = vocab_.wordSize();
     const int NP = vocab_.patientSize();
-    const int PR = vocab_.providerSize();
+    const int ENC = vocab_.encounterSize();
     const int HS = vocab_.huffmanNodes();
-    const int CD = d_w_ + d_p_ + d_pr_;
+    const int CD = d_word_ + d_patient_ + d_encounter_;
 
     output_matrix_.resize(HS,            d_out_);
-    input_matrix_.resize(V,              d_w_);
-    ngram_matrix_.resize(ngram_buckets_, d_w_);
+    input_matrix_.resize(V,              d_word_);
+    ngram_matrix_.resize(ngram_buckets_, d_word_);
     W_proj_.resize(d_out_,              CD);
-    patient_matrix_.resize(NP,           d_p_);
-    provider_matrix_.resize(PR,          d_pr_);
+    patient_matrix_.resize(NP,           d_patient_);
+    encounter_matrix_.resize(ENC,          d_encounter_);
 
     const int T = omp_get_max_threads();
     std::vector<std::mt19937> rngs(T);
@@ -54,9 +54,9 @@ void FastTextContext::initializeMatrices() {
     };
 
     // Xavier-style initialisation for each space.
-    float scale_w   = 1.0f / std::sqrt(static_cast<float>(d_w_));
-    float scale_p   = 1.0f / std::sqrt(static_cast<float>(d_p_));
-    float scale_pr  = 1.0f / std::sqrt(static_cast<float>(d_pr_));
+    float scale_w   = 1.0f / std::sqrt(static_cast<float>(d_word_));
+    float scale_p   = 1.0f / std::sqrt(static_cast<float>(d_patient_));
+    float scale_enc  = 1.0f / std::sqrt(static_cast<float>(d_encounter_));
     float scale_out = 1.0f / std::sqrt(static_cast<float>(d_out_));
 
     initMat(output_matrix_,  scale_out);
@@ -64,15 +64,15 @@ void FastTextContext::initializeMatrices() {
     initMat(ngram_matrix_,   scale_w);
     initMat(W_proj_,         scale_out);  // Xavier for projection
     initMat(patient_matrix_, scale_p);
-    initMat(provider_matrix_,scale_pr);
+    initMat(encounter_matrix_,scale_enc);
 
     std::cout << "Matrices initialised:\n"
-              << "  input:    " << V   << " x " << d_w_   << " (word embeddings)\n"
-              << "  ngram:    " << ngram_buckets_ << " x " << d_w_ << "\n"
+              << "  input:    " << V   << " x " << d_word_   << " (word embeddings)\n"
+              << "  ngram:    " << ngram_buckets_ << " x " << d_word_ << "\n"
               << "  output:   " << HS  << " x " << d_out_ << " (HS nodes)\n"
               << "  W_proj:   " << d_out_ << " x " << CD << "\n"
-              << "  patient:  " << NP  << " x " << d_p_  << "\n"
-              << "  provider: " << PR  << " x " << d_pr_ << "\n"
+              << "  patient:  " << NP  << " x " << d_patient_  << "\n"
+              << "  encounter: " << ENC  << " x " << d_encounter_ << "\n"
               << "  threads:  " << T   << "\n" << std::endl;
 }
 
@@ -100,7 +100,7 @@ void FastTextContext::precomputeWordVectors() {
 void FastTextContext::trainStreaming(const std::string& filename) {
     std::cout << "Building vocabulary from " << filename << "...\n";
 
-    std::unordered_map<std::string, int> word_freq, patient_freq, provider_freq;
+    std::unordered_map<std::string, int> word_freq, patient_freq, encounter_freq;
     std::ifstream file(filename);
     if (!file.is_open()) throw std::runtime_error("Cannot open: " + filename);
 
@@ -124,14 +124,14 @@ void FastTextContext::trainStreaming(const std::string& filename) {
 
         if (groups.size() != 3) continue;
 
-        // Patient fields.
+        // Patient group.
         std::istringstream ps(groups[0]);
         std::string tok;
         while (ps >> tok) patient_freq[tok]++;
 
-        // Provider fields.
+        // Encounter group.
         std::istringstream prs(groups[1]);
-        while (prs >> tok) provider_freq[tok]++;
+        while (prs >> tok) encounter_freq[tok]++;
 
         // Words.
         std::istringstream ws(groups[2]);
@@ -144,7 +144,7 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     std::cout << "\nProcessed " << lc << " lines.\n";
 
     vocab_ = Vocabulary(threshold_);
-    vocab_.buildFromCounts(word_freq, patient_freq, provider_freq);
+    vocab_.buildFromCounts(word_freq, patient_freq, encounter_freq);
     vocab_.buildHuffmanTree();
     vocab_.computeDiscardProbs(subsample_t_);
 
@@ -154,12 +154,12 @@ void FastTextContext::trainStreaming(const std::string& filename) {
     initializeMatrices();
     makeInference();
 
-    Trainer trainer(d_w_, d_p_, d_pr_, d_out_,
+    Trainer trainer(d_word_, d_patient_, d_encounter_, d_out_,
                     epoch_, lr_, min_n_, max_n_,
                     chunk_size_, ngram_buckets_, window_size_, grad_clip_, weight_decay_);
     trainer.train(filename, vocab_,
                   input_matrix_, output_matrix_, ngram_matrix_,
-                  W_proj_, patient_matrix_, provider_matrix_);
+                  W_proj_, patient_matrix_, encounter_matrix_);
 
     // Rebuild inference with final matrices, then precompute cache.
     makeInference();
@@ -187,26 +187,26 @@ static void readVecVec(std::istream& in, std::vector<std::vector<int>>& vv, int 
 }
 
 // Binary format:
-//   [header: d_w, d_p, d_pr, d_out, min_n, max_n, threshold, window_size]
-//   [sizes: vocab_size, patient_size, provider_size, ngram_size, output_size]
+//   [header: d_word, d_patient, d_encounter, d_out, min_n, max_n, threshold, window_size]
+//   [sizes: vocab_size, patient_size, encounter_size, ngram_size, output_size]
 //   [word vocabulary entries]
 //   [patient vocabulary entries]
-//   [provider vocabulary entries]
+//   [encounter vocabulary entries]
 //   [output_matrix data]      // hs_nodes x d_out
-//   [ngram_matrix data]       // ngram_buckets x d_w
-//   [input_matrix data]       // vocab_size x d_w
+//   [ngram_matrix data]       // ngram_buckets x d_word
+//   [input_matrix data]       // vocab_size x d_word
 //   [W_proj data]             // d_out x concat_dim
-//   [patient_matrix data]     // patient_size x d_p
-//   [provider_matrix data]    // provider_size x d_pr
+//   [patient_matrix data]     // patient_size x d_patient
+//   [encounter_matrix data]    // encounter_size x d_encounter
 //   [word_codes]
 //   [word_paths]
 void FastTextContext::saveModel(const std::string& filename) const {
     std::ofstream out(filename, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot open for writing: " + filename);
 
-    out.write(reinterpret_cast<const char*>(&d_w_),         sizeof(d_w_));
-    out.write(reinterpret_cast<const char*>(&d_p_),         sizeof(d_p_));
-    out.write(reinterpret_cast<const char*>(&d_pr_),        sizeof(d_pr_));
+    out.write(reinterpret_cast<const char*>(&d_word_),         sizeof(d_word_));
+    out.write(reinterpret_cast<const char*>(&d_patient_),         sizeof(d_patient_));
+    out.write(reinterpret_cast<const char*>(&d_encounter_),        sizeof(d_encounter_));
     out.write(reinterpret_cast<const char*>(&d_out_),       sizeof(d_out_));
     out.write(reinterpret_cast<const char*>(&min_n_),       sizeof(min_n_));
     out.write(reinterpret_cast<const char*>(&max_n_),       sizeof(max_n_));
@@ -215,12 +215,12 @@ void FastTextContext::saveModel(const std::string& filename) const {
 
     int vs  = vocab_.wordSize();
     int np  = vocab_.patientSize();
-    int npr = vocab_.providerSize();
+    int nenc = vocab_.encounterSize();
     int ng  = static_cast<int>(ngram_matrix_.rows());
     int os  = static_cast<int>(output_matrix_.rows());
     out.write(reinterpret_cast<const char*>(&vs),  sizeof(vs));
     out.write(reinterpret_cast<const char*>(&np),  sizeof(np));
-    out.write(reinterpret_cast<const char*>(&npr), sizeof(npr));
+    out.write(reinterpret_cast<const char*>(&nenc), sizeof(nenc));
     out.write(reinterpret_cast<const char*>(&ng),  sizeof(ng));
     out.write(reinterpret_cast<const char*>(&os),  sizeof(os));
 
@@ -238,21 +238,21 @@ void FastTextContext::saveModel(const std::string& filename) const {
         out.write(m.c_str(), len);
         out.write(reinterpret_cast<const char*>(&i), sizeof(i));
     }
-    for (int i = 0; i < npr; ++i) {
-        const std::string& m = vocab_.getProvider(i);
+    for (int i = 0; i < nenc; ++i) {
+        const std::string& m = vocab_.getEncounter(i);
         uint32_t len = static_cast<uint32_t>(m.size());
         out.write(reinterpret_cast<const char*>(&len), sizeof(len));
         out.write(m.c_str(), len);
         out.write(reinterpret_cast<const char*>(&i), sizeof(i));
     }
 
-    // Matrix order: output, ngram, input, W_proj, patient, provider.
+    // Matrix order: output, ngram, input, W_proj, patient, encounter.
     output_matrix_.save(out);
     ngram_matrix_.save(out);
     input_matrix_.save(out);
     W_proj_.save(out);
     patient_matrix_.save(out);
-    provider_matrix_.save(out);
+    encounter_matrix_.save(out);
 
     writeVecVec(out, vocab_.word_codes_);
     writeVecVec(out, vocab_.word_paths_);
@@ -265,29 +265,29 @@ void FastTextContext::loadModel(const std::string& filename) {
     std::ifstream in(filename, std::ios::binary);
     if (!in) throw std::runtime_error("Cannot open for reading: " + filename);
 
-    in.read(reinterpret_cast<char*>(&d_w_),         sizeof(d_w_));
-    in.read(reinterpret_cast<char*>(&d_p_),         sizeof(d_p_));
-    in.read(reinterpret_cast<char*>(&d_pr_),        sizeof(d_pr_));
+    in.read(reinterpret_cast<char*>(&d_word_),         sizeof(d_word_));
+    in.read(reinterpret_cast<char*>(&d_patient_),         sizeof(d_patient_));
+    in.read(reinterpret_cast<char*>(&d_encounter_),        sizeof(d_encounter_));
     in.read(reinterpret_cast<char*>(&d_out_),       sizeof(d_out_));
     in.read(reinterpret_cast<char*>(&min_n_),       sizeof(min_n_));
     in.read(reinterpret_cast<char*>(&max_n_),       sizeof(max_n_));
     in.read(reinterpret_cast<char*>(&threshold_),   sizeof(threshold_));
     in.read(reinterpret_cast<char*>(&window_size_), sizeof(window_size_));
 
-    int vs, np, npr, ng, os;
+    int vs, np, nenc, ng, os;
     in.read(reinterpret_cast<char*>(&vs),  sizeof(vs));
     in.read(reinterpret_cast<char*>(&np),  sizeof(np));
-    in.read(reinterpret_cast<char*>(&npr), sizeof(npr));
+    in.read(reinterpret_cast<char*>(&nenc), sizeof(nenc));
     in.read(reinterpret_cast<char*>(&ng),  sizeof(ng));
     in.read(reinterpret_cast<char*>(&os),  sizeof(os));
 
-    int concat_dim = d_w_ + d_p_ + d_pr_;
+    int concat_dim = d_word_ + d_patient_ + d_encounter_;
     output_matrix_.resize(os,            d_out_);
-    ngram_matrix_.resize(ng,             d_w_);
-    input_matrix_.resize(vs,             d_w_);
+    ngram_matrix_.resize(ng,             d_word_);
+    input_matrix_.resize(vs,             d_word_);
     W_proj_.resize(d_out_,              concat_dim);
-    patient_matrix_.resize(np,           d_p_);
-    provider_matrix_.resize(npr,         d_pr_);
+    patient_matrix_.resize(np,           d_patient_);
+    encounter_matrix_.resize(nenc,         d_encounter_);
 
     for (int i = 0; i < vs; ++i) {
         uint32_t len; in.read(reinterpret_cast<char*>(&len), sizeof(len));
@@ -301,11 +301,11 @@ void FastTextContext::loadModel(const std::string& filename) {
         int idx;      in.read(reinterpret_cast<char*>(&idx), sizeof(idx));
         vocab_.addPatient(idx, field);
     }
-    for (int i = 0; i < npr; ++i) {
+    for (int i = 0; i < nenc; ++i) {
         uint32_t len; in.read(reinterpret_cast<char*>(&len), sizeof(len));
         std::string field(len, '\0'); in.read(&field[0], len);
         int idx;      in.read(reinterpret_cast<char*>(&idx), sizeof(idx));
-        vocab_.addProvider(idx, field);
+        vocab_.addEncounter(idx, field);
     }
 
     output_matrix_.load(in);
@@ -313,7 +313,7 @@ void FastTextContext::loadModel(const std::string& filename) {
     input_matrix_.load(in);
     W_proj_.load(in);
     patient_matrix_.load(in);
-    provider_matrix_.load(in);
+    encounter_matrix_.load(in);
 
     readVecVec(in, vocab_.word_codes_, vs);
     readVecVec(in, vocab_.word_paths_, vs);
@@ -322,12 +322,12 @@ void FastTextContext::loadModel(const std::string& filename) {
     makeInference();
     precomputeWordVectors();
     std::cout << "Model loaded from " << filename
-              << " (d_w=" << d_w_ << " d_p=" << d_p_ << " d_pr=" << d_pr_
+              << " (d_word=" << d_word_ << " d_patient=" << d_patient_ << " d_encounter=" << d_encounter_
               << " d_out=" << d_out_ << " vocab=" << vs
-              << " patient=" << np << " provider=" << npr << ")" << std::endl;
+              << " patient=" << np << " encounter=" << nenc << ")" << std::endl;
 }
 
-// Returns d_w-dimensional raw word vector (word_emb + ngrams).
+// Returns d_word-dimensional raw word vector (word_emb + ngrams).
 // The cached_word_vectors_ holds projected d_out vectors for NN search — not usable here.
 // Always delegates to Inference::getWordVector for the correct unprojected representation.
 std::vector<float> FastTextContext::getWordVector(const std::string& word) {
@@ -337,19 +337,19 @@ std::vector<float> FastTextContext::getWordVector(const std::string& word) {
 
 std::vector<float> FastTextContext::getCombinedVector(
     const std::vector<std::string>& words,
-    const std::vector<std::string>& patient_meta,
-    const std::vector<std::string>& provider_meta) {
+    const std::vector<std::string>& patient_group,
+    const std::vector<std::string>& encounter_group) {
     if (!inference_) throw std::runtime_error("Model not initialised.");
-    return inference_->getCombinedVector(words, patient_meta, provider_meta);
+    return inference_->getCombinedVector(words, patient_group, encounter_group);
 }
 
 std::vector<std::pair<std::string, float>> FastTextContext::getNearestNeighbors(
     const std::vector<std::string>& words,
-    const std::vector<std::string>& patient_meta,
-    const std::vector<std::string>& provider_meta,
+    const std::vector<std::string>& patient_group,
+    const std::vector<std::string>& encounter_group,
     int k) {
     if (!inference_) throw std::runtime_error("Model not initialised.");
-    return inference_->getNearestNeighbors(words, patient_meta, provider_meta, k,
+    return inference_->getNearestNeighbors(words, patient_group, encounter_group, k,
                                            cached_word_vectors_);
 }
 

@@ -14,7 +14,7 @@ public:
 
     void buildFromCounts(const std::unordered_map<std::string, int>& word_freq,
                          const std::unordered_map<std::string, int>& patient_freq,
-                         const std::unordered_map<std::string, int>& provider_freq);
+                         const std::unordered_map<std::string, int>& encounter_freq);
 
     void buildHuffmanTree();
     void computeDiscardProbs(float t);
@@ -44,17 +44,17 @@ public:
     }
     inline int patientSize() const { return static_cast<int>(patient2idx_.size()); }
 
-    // Provider metadata vocabulary (no threshold).
-    inline int getProviderIdx(const std::string& field) const {
-        auto it = provider2idx_.find(field);
-        return it != provider2idx_.end() ? it->second : -1;
+    // Encounter group vocabulary (no threshold).
+    inline int getEncounterIdx(const std::string& field) const {
+        auto it = encounter2idx_.find(field);
+        return it != encounter2idx_.end() ? it->second : -1;
     }
-    inline const std::string& getProvider(int idx) const {
+    inline const std::string& getEncounter(int idx) const {
         static const std::string empty;
-        if (idx < 0 || idx >= static_cast<int>(idx2provider_.size())) return empty;
-        return idx2provider_[idx];
+        if (idx < 0 || idx >= static_cast<int>(idx2encounter_.size())) return empty;
+        return idx2encounter_[idx];
     }
-    inline int providerSize() const { return static_cast<int>(provider2idx_.size()); }
+    inline int encounterSize() const { return static_cast<int>(encounter2idx_.size()); }
 
     // Serialization helpers.
     void addWord(int idx, const std::string& word) {
@@ -67,10 +67,10 @@ public:
         if (idx >= static_cast<int>(idx2patient_.size())) idx2patient_.resize(idx + 1);
         idx2patient_[idx] = field;
     }
-    void addProvider(int idx, const std::string& field) {
-        provider2idx_[field] = idx;
-        if (idx >= static_cast<int>(idx2provider_.size())) idx2provider_.resize(idx + 1);
-        idx2provider_[idx] = field;
+    void addEncounter(int idx, const std::string& field) {
+        encounter2idx_[field] = idx;
+        if (idx >= static_cast<int>(idx2encounter_.size())) idx2encounter_.resize(idx + 1);
+        idx2encounter_[idx] = field;
     }
 
     std::vector<std::vector<int>> word_codes_;
@@ -85,11 +85,11 @@ private:
 
     std::unordered_map<std::string, int> word2idx_;
     std::unordered_map<std::string, int> patient2idx_;
-    std::unordered_map<std::string, int> provider2idx_;
+    std::unordered_map<std::string, int> encounter2idx_;
 
     std::vector<std::string> idx2word_;
     std::vector<std::string> idx2patient_;
-    std::vector<std::string> idx2provider_;
+    std::vector<std::string> idx2encounter_;
 };
 
 } // namespace fasttext

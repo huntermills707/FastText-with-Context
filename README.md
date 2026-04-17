@@ -1,27 +1,27 @@
 # FastTextContext
 
-A high-performance C++ implementation of FastText extended with a **concatenation-with-projection** architecture for stratified metadata groups. Built from scratch with OpenMP parallelization, it supports streaming training on large datasets and learns separate low-dimensional embeddings for each metadata group (patients, providers), which are concatenated and projected into a shared output space.
+A high-performance C++ implementation of FastText extended with a **concatenation-with-projection** architecture for stratified group covariates. Built from scratch with OpenMP parallelization, it supports streaming training on large datasets and learns separate low-dimensional embeddings for each group (patients, encounters), which are concatenated and projected into a shared output space.
 
 The project ships with a MIMIC-III preprocessing pipeline, a two-stage hierarchical bootstrap workflow for confidence intervals, and a pure-numpy Python loader for inference and diagnostics.
 
 ## Key Features
 
-- **Stratified Metadata Groups**: Each metadata group (patient demographics, provider role) gets its own embedding space and dimension. Groups are concatenated and projected through a learned matrix rather than additively combined.
-  - Forward pass: `concat = [word_part ; patient_avg ; provider_avg]` → `center_vec = W_proj × concat`
+- **Stratified Groups**: Each group (patient demographics, encounter role) gets its own embedding space and dimension. Groups are concatenated and projected through a learned matrix rather than additively combined.
+  - Forward pass: `concat = [word_part ; patient_avg ; encounter_avg]` → `center_vec = W_proj × concat`
   - Extensible: adding a fourth group (e.g. outcomes) requires only a new embedding matrix and widening `W_proj` by `d_outcome` columns.
-- **Hybrid Optimization**: Sparse word and n-gram parameters use Hogwild lock-free SGD. Dense parameters (`W_proj`, patient embeddings, provider embeddings) use thread-local copies with periodic synchronized averaging — one sync point per chunk, not per sample.
+- **Hybrid Optimization**: Sparse word and n-gram parameters use Hogwild lock-free SGD. Dense parameters (`W_proj`, patient embeddings, encounter embeddings) use thread-local copies with periodic synchronized averaging — one sync point per chunk, not per sample.
 - **Streaming Training**: Two-pass architecture (vocabulary counting → training) handles datasets larger than RAM.
 - **Hierarchical Softmax**: Huffman tree construction for O(log V) training complexity.
 - **Subword Awareness**: Character n-grams (configurable range) handle out-of-vocabulary words.
 - **Statistical Uncertainty**: Two-stage hierarchical bootstrap (patients → notes) for computing 95% confidence intervals on any similarity query, via `run_bootstrap.sh` + `compare_bootstrap.py`.
 - **C++ Binaries**:
   - `train`: Streamlined training pipeline.
-  - `query`: Interactive nearest-neighbor search with grouped metadata.
-  - `compare`: Cosine/Euclidean similarity between complex word + metadata combinations.
+  - `query`: Interactive nearest-neighbor search with grouped covariates.
+  - `compare`: Cosine/Euclidean similarity between complex word + group combinations.
 - **Python Tooling**:
   - `fasttext_context.py`: Pure-numpy model loader for inference and diagnostics.
   - `compare_bootstrap.py`: Bootstrap-based similarity with 95% CIs.
-  - `dump_metadata.py`: Export patient/provider vocabularies for inspection.
+  - `dump_metadata.py`: Export patient/encounter group vocabularies for inspection.
 
 ## Prerequisites
 
@@ -54,7 +54,7 @@ python3 generate_demo_sentences.py          # writes training_data_with_context.
 Input lines use triple-pipe delimiters between groups:
 
 ```
-<PatientGroup> ||| <ProviderGroup> ||| <WordsGroup>
+<PatientGroup> ||| <EncounterGroup> ||| <WordsGroup>
 ```
 
 - Each group's tokens are space-delimited.
@@ -62,10 +62,13 @@ Input lines use triple-pipe delimiters between groups:
 - Groups may be empty; the delimiters are always present.
 - The words group is always last.
 
+**Note on Token Formats:**
+The MIMIC-III preprocessing pipeline emits prefixed tokens (e.g., `age_group:elderly`, `caregiver_role:physician`) while the demo generator (`generate_demo_sentences.py`) emits bare tokens (`elderly`, `physician`). Both are valid; the model treats tokens as opaque strings. However, you must be consistent: train and query using the same format.
+
 **Examples:**
 
 ```
-elderly male white english medicare married ||| attending emergency ||| the patient was admitted with chest pain
+age_group:elderly gender:male ethnicity:white language:english insurance:medicare marital_status:married ||| caregiver_role:attending admission_type:emergency ||| the patient was admitted with chest pain
 aged female hispanic ||| resident_physician elective ||| scheduled for elective knee replacement
  ||| nurse urgent ||| vital signs were stable on admission
 elderly male ||| ||| no acute distress noted on examination
@@ -88,7 +91,7 @@ elderly male ||| ||| no acute distress noted on examination
 **Full example (MIMIC-III scale):**
 
 ```bash
-./train -d-word 150 -d-patient 30 -d-provider 15 -d-out 150 \
+./train -d-word 150 -d-patient 30 -d-encounter 15 -d-out 150 \
         -epoch 10 -lr 0.05 -chunk-size 1000 -threads 8 \
         -weight-decay 1e-5 -grad-clip 1.0 \
         mimic-iii-sents.txt model.bin
@@ -100,13 +103,13 @@ elderly male ||| ||| no acute distress noted on examination
 | :--- | :--- | :--- |
 | `-d-word` | `150` | Word + n-gram embedding dimension |
 | `-d-patient` | `30` | Patient group embedding dimension |
-| `-d-provider` | `15` | Provider group embedding dimension |
+| `-d-encounter` | `15` | Encounter group embedding dimension |
 | `-d-out` | `150` | Output/projected dimension for HS |
 | `-epoch` | `5` | Training epochs |
 | `-lr` | `0.05` | Initial learning rate (linear decay to 0.01% of initial) |
 | `-minn` | `3` | Minimum character n-gram length |
 | `-maxn` | `8` | Maximum character n-gram length |
-| `-threshold` | `5` | Minimum word frequency; patient/provider fields are not filtered |
+| `-threshold` | `5` | Minimum word frequency; patient/encounter group fields are not filtered |
 | `-subsample` | `1e-4` | Subsampling threshold `t`; high-frequency words skipped with prob `1 - sqrt(t/freq)` |
 | `-grad-clip` | `1.0` | Max L2 norm for gradient vectors (0 = off) |
 | `-weight-decay` | `0` | L2 decay applied to `W_proj` after each chunk reduce (e.g. `1e-5`); 0 = off |
@@ -117,10 +120,10 @@ elderly male ||| ||| no acute distress noted on examination
 
 ### 2. Querying (Nearest Neighbors)
 
-Find words semantically similar to a query, optionally conditioned on grouped metadata.
+Find words semantically similar to a query, optionally conditioned on grouped covariates.
 
 ```bash
-./query <model.bin> <word1> [word2 ...] [--patient <p1> [p2 ...]] [--provider <pr1> [pr2 ...]] [--k <num>]
+./query <model.bin> <word1> [word2 ...] [--patient <p1> [p2 ...]] [--encounter <e1> [e2 ...]] [--k <num>]
 ```
 
 **Examples:**
@@ -132,7 +135,7 @@ Find words semantically similar to a query, optionally conditioned on grouped me
 # Words + full context
 ./query model.bin chest pain \
     --patient elderly male white medicare \
-    --provider attending emergency \
+    --encounter attending emergency \
     --k 10
 
 # Words + patient context only
@@ -141,12 +144,12 @@ Find words semantically similar to a query, optionally conditioned on grouped me
 
 ### 3. Comparing Vectors
 
-Calculate similarity metrics between two queries, each with independent metadata context.
+Calculate similarity metrics between two queries, each with independent group context.
 
 ```bash
 ./compare <model.bin> \
-    --words1 <w1> [w2 ...] [--patient1 <p1> ...] [--provider1 <pr1> ...] \
-    --words2 <w1> [w2 ...] [--patient2 <p1> ...] [--provider2 <pr1> ...]
+    --words1 <w1> [w2 ...] [--patient1 <p1> ...] [--encounter1 <e1> ...] \
+    --words2 <w1> [w2 ...] [--patient2 <p1> ...] [--encounter2 <e1> ...]
 ```
 
 **Examples:**
@@ -157,15 +160,15 @@ Calculate similarity metrics between two queries, each with independent metadata
     --words1 chest pain --patient1 elderly male \
     --words2 chest pain --patient2 young_adult female
 
-# Same words, different provider context
+# Same words, different encounter context
 ./compare model.bin \
-    --words1 shortness of breath --provider1 attending emergency \
-    --words2 shortness of breath --provider2 resident elective
+    --words1 shortness of breath --encounter1 attending emergency \
+    --words2 shortness of breath --encounter2 resident elective
 
 # Full context comparison
 ./compare model.bin \
-    --words1 pain --patient1 elderly male white medicare --provider1 attending \
-    --words2 pain --patient2 adult female hispanic medicaid --provider2 nurse
+    --words1 pain --patient1 elderly male white medicare --encounter1 attending \
+    --words2 pain --patient2 adult female hispanic medicaid --encounter2 nurse
 ```
 
 **Output:**
@@ -209,12 +212,12 @@ Once the ensemble is trained, `compare_bootstrap.py` computes 95% CIs on the cos
 
 ```
 # bases.txt
-chest pain ||| elderly male ||| attending
-shortness of breath ||| young_adult female ||| resident_physician
+chest pain ||| age_group:elderly gender:male ||| caregiver_role:attending
+shortness of breath ||| age_group:young_adult gender:female ||| caregiver_role:resident_physician
 
 # targets.txt
-dyspnea ||| elderly male ||| attending
-myocardial infarction ||| aged male ||| attending
+dyspnea ||| age_group:elderly gender:male ||| caregiver_role:attending
+myocardial infarction ||| age_group:aged gender:male ||| caregiver_role:attending
 ```
 
 **Run:**
@@ -238,9 +241,9 @@ chest pain elderly attending             | dyspnea elderly attending            
 chest pain elderly attending             | myocardial infarction aged attending     |   0.7123 | [0.6801, 0.7452]
 ```
 
-### 6. Inspecting Metadata Vocabularies
+### 6. Inspecting Group Vocabularies
 
-`dump_metadata.py` writes out the learned patient and provider vocabularies from a trained model — useful for sanity-checking field normalization and for assembling query inputs.
+`dump_metadata.py` writes out the learned patient and encounter vocabularies from a trained model — useful for sanity-checking field normalization and for assembling query inputs.
 
 ```bash
 python3 dump_metadata.py    # reads mimic-iii.bin by default
@@ -248,8 +251,8 @@ python3 dump_metadata.py    # reads mimic-iii.bin by default
 
 **Outputs:**
 
-- `patient_metadata.txt` — one patient field per line, sorted.
-- `provider_metadata.txt` — one provider field per line, sorted.
+- `patient_fields.txt` — one patient group field per line, sorted.
+- `encounter_fields.txt` — one encounter group field per line, sorted.
 
 The model path is hardcoded to `mimic-iii.bin` at the top of the script; edit it there to point at a different model.
 
@@ -265,25 +268,25 @@ from fasttext_context import FastTextContext
 ft = FastTextContext()
 ft.load_model("model.bin")
 
-# Raw word vector (d_w-dimensional, unprojected)
+# Raw word vector (d_word-dimensional, unprojected)
 vec = ft.get_word_vector("pain")
 
 # Combined vector (all groups, projected, L2-normalised, d_out-dimensional)
 combined = ft.get_combined_vector(
     words=["chest", "pain"],
-    patient_meta=["elderly", "male"],
-    provider_meta=["attending"]
+    patient_group=["age_group:elderly", "gender:male"],
+    encounter_group=["caregiver_role:attending"]
 )
 
 # Group ablation: any subset of groups, absent ones are zeroed
 words_only    = ft.get_group_vector(words=["chest", "pain"])
-with_patient  = ft.get_group_vector(words=["chest", "pain"], patient_meta=["elderly"])
-with_provider = ft.get_group_vector(words=["chest", "pain"], provider_meta=["attending"])
+with_patient  = ft.get_group_vector(words=["chest", "pain"], patient_group=["age_group:elderly"])
+with_encounter = ft.get_group_vector(words=["chest", "pain"], encounter_group=["caregiver_role:attending"])
 
 # Nearest neighbors
 neighbors = ft.get_nearest_neighbors(
     ["chest", "pain"],
-    patient_meta=["elderly", "male"],
+    patient_group=["age_group:elderly", "gender:male"],
     k=10
 )
 for word, score in neighbors:
@@ -291,15 +294,15 @@ for word, score in neighbors:
 
 # Compare two contexts
 result = ft.compare_vectors(
-    ["pain"], ["elderly"], ["attending"],
-    ["pain"], ["young_adult"], ["resident"]
+    ["pain"], ["age_group:elderly"], ["caregiver_role:attending"],
+    ["pain"], ["age_group:young_adult"], ["caregiver_role:resident"]
 )
 print(result["cosine_similarity"])
 
 # Diagnostics
-ft.print_projection_block_norms()  # check word/patient/provider blocks in W_proj
+ft.print_projection_block_norms()  # check word/patient/encounter blocks in W_proj
 ft.print_patient_vocab()
-ft.print_provider_vocab()
+ft.print_encounter_vocab()
 ```
 
 ## Architecture

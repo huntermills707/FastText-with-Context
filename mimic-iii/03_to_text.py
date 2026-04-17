@@ -6,7 +6,7 @@ Reads:
 
 Writes:
     mimic-iii-sents.txt (default) or a named output file.
-    Each line: <PatientGroup> ||| <ProviderGroup> ||| <sentence>
+    Each line: <PatientGroup> ||| <EncounterGroup> ||| <sentence>
 
 Modes:
     Default  -- all notes, sentences exploded and shuffled.
@@ -136,14 +136,14 @@ def _write(
     note_idx: np.ndarray,
     sent_idx: np.ndarray,
     patient_groups: list,
-    provider_groups: list,
+    encounter_groups: list,
     sentences_col: list,
 ) -> int:
     written = 0
     with open(out_path, 'w', encoding='utf-8') as fp:
         for ni, si in zip(note_idx.tolist(), sent_idx.tolist()):
             sent = sentences_col[ni][si]
-            fp.write(f"{patient_groups[ni]} ||| {provider_groups[ni]} ||| {sent}\n")
+            fp.write(f"{patient_groups[ni]} ||| {encounter_groups[ni]} ||| {sent}\n")
             written += 1
     return written
 
@@ -197,12 +197,12 @@ def main():
     t0  = time.time()
     df  = pl.read_parquet(args.input)
 
-    subject_ids     = df['SUBJECT_ID'].to_list()
-    patient_groups  = df['PatientGroup'].to_list()
-    provider_groups = df['ProviderGroup'].to_list()
-    sentences_col   = df['Sentences'].to_list()
-    n_notes         = len(subject_ids)
-    n_patients      = len(set(subject_ids))
+    subject_ids      = df['SUBJECT_ID'].to_list()
+    patient_groups   = df['patient_group'].to_list()
+    encounter_groups = df['encounter_group'].to_list()
+    sentences_col    = df['Sentences'].to_list()
+    n_notes          = len(subject_ids)
+    n_patients       = len(set(subject_ids))
     del df  # release Polars DataFrame memory before building index arrays
 
     print(f"  {n_notes:,} notes  |  {n_patients:,} unique patients")
@@ -229,7 +229,7 @@ def main():
     # ------------------------------------------------------------------
     total_sents = len(note_idx)
     print(f"Writing {total_sents:,} sentence rows to {args.out}...")
-    written = _write(args.out, note_idx, sent_idx, patient_groups, provider_groups, sentences_col)
+    written = _write(args.out, note_idx, sent_idx, patient_groups, encounter_groups, sentences_col)
 
     elapsed = time.time() - t0
     out_mb  = Path(args.out).stat().st_size / 1_048_576

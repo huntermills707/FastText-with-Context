@@ -9,7 +9,7 @@ namespace fasttext {
 
 void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& word_freq,
                                  const std::unordered_map<std::string, int>& patient_freq,
-                                 const std::unordered_map<std::string, int>& provider_freq) {
+                                 const std::unordered_map<std::string, int>& encounter_freq) {
     // Words: sort by frequency descending, apply threshold.
     int word_idx = 0, filtered = 0;
     std::vector<std::pair<std::string, int>> sorted_words(word_freq.begin(), word_freq.end());
@@ -27,7 +27,7 @@ void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& wor
         }
     }
 
-    // Patient fields: all kept, sorted by frequency.
+    // Patient group fields: all kept, sorted by frequency.
     int pat_idx = 0;
     std::vector<std::pair<std::string, int>> sorted_patient(patient_freq.begin(), patient_freq.end());
     std::sort(sorted_patient.begin(), sorted_patient.end(),
@@ -38,23 +38,23 @@ void Vocabulary::buildFromCounts(const std::unordered_map<std::string, int>& wor
         ++pat_idx;
     }
 
-    // Provider fields: all kept, sorted by frequency.
-    int prov_idx = 0;
-    std::vector<std::pair<std::string, int>> sorted_provider(provider_freq.begin(), provider_freq.end());
-    std::sort(sorted_provider.begin(), sorted_provider.end(),
+    // Encounter group fields: all kept, sorted by frequency.
+    int enc_idx = 0;
+    std::vector<std::pair<std::string, int>> sorted_encounter(encounter_freq.begin(), encounter_freq.end());
+    std::sort(sorted_encounter.begin(), sorted_encounter.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-    for (const auto& [field, count] : sorted_provider) {
-        provider2idx_[field] = prov_idx;
-        idx2provider_.push_back(field);
-        ++prov_idx;
+    for (const auto& [field, count] : sorted_encounter) {
+        encounter2idx_[field] = enc_idx;
+        idx2encounter_.push_back(field);
+        ++enc_idx;
     }
 
     std::cout << "\n=== VOCABULARY BUILD SUMMARY ===\n"
               << "Unique words in file:        " << word_freq.size()   << "\n"
               << "Words meeting threshold(" << threshold_ << "): " << word_idx  << "\n"
               << "Words filtered out:          " << filtered            << "\n"
-              << "Patient metadata fields:     " << pat_idx             << "\n"
-              << "Provider metadata fields:    " << prov_idx            << "\n"
+              << "Patient group fields:        " << pat_idx             << "\n"
+              << "Encounter group fields:      " << enc_idx            << "\n"
               << "================================\n" << std::endl;
 }
 

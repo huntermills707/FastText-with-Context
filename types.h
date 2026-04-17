@@ -8,10 +8,10 @@
 namespace fasttext {
 
 // Training sample parsed from triple-pipe-delimited file.
-// Format: <PatientGroup> ||| <ProviderGroup> ||| <WordsGroup>
+// Format: <PatientGroup> ||| <EncounterGroup> ||| <WordsGroup>
 struct GroupedSample {
-    std::vector<std::string> patient_fields;   // e.g., {"elderly", "male", "white"}
-    std::vector<std::string> provider_fields;  // e.g., {"attending", "emergency"}
+    std::vector<std::string> patient_group;    // e.g., {"elderly", "male", "white"}
+    std::vector<std::string> encounter_group;  // e.g., {"attending", "emergency"}
     // Future: std::vector<std::string> outcome_fields;
     std::vector<std::string> words;            // sentence tokens
 };

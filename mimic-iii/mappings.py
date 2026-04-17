@@ -66,7 +66,7 @@ _CG_MAP = {
 }
 
 def map_cg_title(title: str) -> str:
-    """Normalise a raw CG_TITLE string to a provider group label."""
+    """Normalise a raw CG_TITLE string to an encounter group label."""
     if title is None:
         return 'other'
     return _CG_MAP.get(title.strip().lower(), 'other')

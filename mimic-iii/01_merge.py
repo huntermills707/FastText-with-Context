@@ -32,13 +32,13 @@ from mappings import (
 
 # Patient-level columns kept in the output.
 PATIENT_COLS = [
-    'MeSH', 'GENDER', 'ETHNICITY', 'LANGUAGE',
-    'RELIGION', 'MARITAL_STATUS', 'INSURANCE',
+    'age_group', 'gender', 'ethnicity', 'language',
+    'religion', 'marital_status', 'insurance',
 ]
 
-# Provider-level columns kept in the output.
-PROVIDER_COLS = [
-    'CG_TITLE', 'ADMISSION_TYPE', 'LOS', 'DEATH'
+# Encounter-level columns kept in the output.
+ENCOUNTER_COLS = [
+    'caregiver_role', 'admission_type', 'length_of_stay', 'mortality'
 ]
 
 # --- Pipeline helpers --------------------------------------------------
@@ -53,16 +53,16 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     notes      = pl.scan_parquet(data_dir / 'NOTEEVENTS.parquet')
 
     # ------------------------------------------------------------------
-    # Admissions: derive DEATH flag, select needed columns.
+    # Admissions: derive mortality flag, select needed columns.
     # ------------------------------------------------------------------
     admissions = admissions.with_columns(
         pl.when(pl.col('HOSPITAL_EXPIRE_FLAG') == 1)
           .then(pl.lit('Dead'))
           .otherwise(pl.lit('Alive'))
-          .alias('DEATH')
+          .alias('mortality')
     ).select([
         'HADM_ID', 'ADMITTIME', 'DISCHTIME', 'ADMISSION_TYPE', 'INSURANCE',
-        'LANGUAGE', 'RELIGION', 'MARITAL_STATUS', 'ETHNICITY', 'DEATH',
+        'LANGUAGE', 'RELIGION', 'MARITAL_STATUS', 'ETHNICITY', 'mortality',
     ])
 
     # ------------------------------------------------------------------
@@ -71,7 +71,7 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     caregivers = (
         caregivers
         .select(['CGID', 'LABEL'])
-        .rename({'LABEL': 'CG_TITLE'})
+        .rename({'LABEL': 'caregiver_role'})
     )
 
     notes = notes.select(['ROW_ID', 'SUBJECT_ID', 'HADM_ID', 'CGID', 'TEXT'])
@@ -93,7 +93,7 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     notes = notes.join(admissions,  on='HADM_ID',     how='left')
 
     # ------------------------------------------------------------------
-    # Age calculation → MeSH category.
+    # Age calculation → age_group category.
     # ------------------------------------------------------------------
     notes = notes.with_columns([
         pl.col('ADMITTIME').str.to_datetime(strict=False),
@@ -116,7 +116,7 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
         .when(pl.col('age')  >= 13).then(pl.lit('Adolescent'))
         .when(pl.col('age')  >= 2) .then(pl.lit('Child'))
         .otherwise(pl.lit('Infant'))
-        .alias('MeSH')
+        .alias('age_group')
     )
 
     # ------------------------------------------------------------------
@@ -126,16 +126,16 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     notes = notes.with_columns(
         ((pl.col('DISCHTIME') - pl.col('ADMITTIME')).dt.total_days())
         .floor()
-        .alias('LOS')
+        .alias('length_of_stay')
     )
 
     notes = notes.with_columns(
-        pl.when(pl.col('LOS') >= 30).then(pl.lit('Long'))
-        .when(pl.col('LOS') >= 14).then(pl.lit('Prolonged'))
-        .when(pl.col('LOS') >= 7).then(pl.lit('Extended'))
-        .when(pl.col('LOS') >= 3).then(pl.lit('Moderate'))
+        pl.when(pl.col('length_of_stay') >= 30).then(pl.lit('Long'))
+        .when(pl.col('length_of_stay') >= 14).then(pl.lit('Prolonged'))
+        .when(pl.col('length_of_stay') >= 7).then(pl.lit('Extended'))
+        .when(pl.col('length_of_stay') >= 3).then(pl.lit('Moderate'))
         .otherwise(pl.lit('Short'))
-        .alias('LOS')
+        .alias('length_of_stay')
     )
 
 
@@ -143,25 +143,35 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     # Normalise and group patient/admission metadata.
     # ------------------------------------------------------------------
     notes = notes.with_columns([
-        pl.col('RELIGION')
+        pl.col('RELIGION').alias('religion'),
+        pl.col('LANGUAGE').alias('language'),
+        pl.col('ETHNICITY').alias('ethnicity'),
+        pl.col('GENDER').alias('gender'),
+        pl.col('MARITAL_STATUS').alias('marital_status'),
+        pl.col('INSURANCE').alias('insurance'),
+        pl.col('ADMISSION_TYPE').alias('admission_type'),
+    ])
+
+    notes = notes.with_columns([
+        pl.col('religion')
         .str.strip_chars()
         .str.to_lowercase()
         .str.replace_all(' ', '_')
         .replace_strict(_RELIGION_MAP, default='unknown'),
 
-        pl.col('LANGUAGE')
+        pl.col('language')
         .str.strip_chars()
         .str.to_lowercase()
         .str.replace_all(' ', '_')
         .replace_strict(_LANGUAGE_MAP, default='unknown'),
 
-        pl.col('ETHNICITY')
+        pl.col('ethnicity')
         .str.strip_chars()
         .str.to_lowercase()
         .str.replace_all(' ', '_')
         .replace_strict(_ETHNICITY_MAP, default='unknown'),
 
-        pl.col('CG_TITLE')
+        pl.col('caregiver_role')
         .str.strip_chars()
         .str.to_lowercase()
         .str.replace_all(' ', '_')
@@ -171,7 +181,7 @@ def build_lazy_pipeline(data_dir: Path) -> pl.LazyFrame:
     # ------------------------------------------------------------------
     # Normalise remaining metadata: lowercase, spaces → underscores.
     # ------------------------------------------------------------------
-    all_meta_cols = PATIENT_COLS + PROVIDER_COLS
+    all_meta_cols = PATIENT_COLS + ENCOUNTER_COLS
     notes = notes.with_columns([
         pl.col(col).cast(pl.Utf8).str.to_lowercase().str.replace_all(' ', '_')
         for col in all_meta_cols

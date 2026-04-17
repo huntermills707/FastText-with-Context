@@ -7,11 +7,11 @@
 
 void printUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " <model.bin> \\\n"
-              << "       --words1 <w1> [w2 ...] [--patient1 <p1> [p2 ...]] [--provider1 <pr1> [pr2 ...]] \\\n"
-              << "       --words2 <w1> [w2 ...] [--patient2 <p1> [p2 ...]] [--provider2 <pr1> [pr2 ...]]\n\n"
+              << "       --words1 <w1> [w2 ...] [--patient1 <p1> [p2 ...]] [--encounter1 <e1> [e2 ...]] \\\n"
+              << "       --words2 <w1> [w2 ...] [--patient2 <p1> [p2 ...]] [--encounter2 <e1> [e2 ...]]\n\n"
               << "Examples:\n"
-              << "  " << prog << " model.bin --words1 chest pain --patient1 elderly male --provider1 attending \\\n"
-              << "                            --words2 chest pain --patient2 young_adult female --provider2 resident\n"
+              << "  " << prog << " model.bin --words1 chest pain --patient1 elderly male --encounter1 attending \\\n"
+              << "                            --words2 chest pain --patient2 young_adult female --encounter2 resident\n"
               << "  " << prog << " model.bin --words1 market --patient1 elderly --words2 market --patient2 young_adult\n"
               << std::endl;
 }
@@ -20,27 +20,27 @@ int main(int argc, char* argv[]) {
     if (argc < 5) { printUsage(argv[0]); return 1; }
 
     std::string modelFile = argv[1];
-    std::vector<std::string> words1, words2, patient1, patient2, provider1, provider2;
+    std::vector<std::string> words1, words2, patient1, patient2, encounter1, encounter2;
 
-    enum class State { DEFAULT, WORDS1, PATIENT1, PROVIDER1, WORDS2, PATIENT2, PROVIDER2 };
+    enum class State { DEFAULT, WORDS1, PATIENT1, ENCOUNTER1, WORDS2, PATIENT2, ENCOUNTER2 };
     State state = State::DEFAULT;
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--words1")    { state = State::WORDS1;    continue; }
-        else if (arg == "--patient1")  { state = State::PATIENT1;  continue; }
-        else if (arg == "--provider1") { state = State::PROVIDER1; continue; }
-        else if (arg == "--words2")    { state = State::WORDS2;    continue; }
-        else if (arg == "--patient2")  { state = State::PATIENT2;  continue; }
-        else if (arg == "--provider2") { state = State::PROVIDER2; continue; }
+        if      (arg == "--words1")      { state = State::WORDS1;     continue; }
+        else if (arg == "--patient1")    { state = State::PATIENT1;   continue; }
+        else if (arg == "--encounter1")  { state = State::ENCOUNTER1; continue; }
+        else if (arg == "--words2")      { state = State::WORDS2;     continue; }
+        else if (arg == "--patient2")    { state = State::PATIENT2;   continue; }
+        else if (arg == "--encounter2")  { state = State::ENCOUNTER2; continue; }
 
         switch (state) {
-            case State::WORDS1:    words1.push_back(arg);    break;
-            case State::PATIENT1:  patient1.push_back(arg);  break;
-            case State::PROVIDER1: provider1.push_back(arg); break;
-            case State::WORDS2:    words2.push_back(arg);    break;
-            case State::PATIENT2:  patient2.push_back(arg);  break;
-            case State::PROVIDER2: provider2.push_back(arg); break;
+            case State::WORDS1:      words1.push_back(arg);      break;
+            case State::PATIENT1:    patient1.push_back(arg);    break;
+            case State::ENCOUNTER1:  encounter1.push_back(arg);  break;
+            case State::WORDS2:      words2.push_back(arg);      break;
+            case State::PATIENT2:    patient2.push_back(arg);    break;
+            case State::ENCOUNTER2:  encounter2.push_back(arg);  break;
             default: std::cerr << "Unexpected arg: " << arg << "\n"; return 1;
         }
     }
@@ -55,8 +55,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Loading model from " << modelFile << "...\n";
         ft.loadModel(modelFile);
 
-        std::vector<float> vec1 = ft.getCombinedVector(words1, patient1, provider1);
-        std::vector<float> vec2 = ft.getCombinedVector(words2, patient2, provider2);
+        std::vector<float> vec1 = ft.getCombinedVector(words1, patient1, encounter1);
+        std::vector<float> vec2 = ft.getCombinedVector(words2, patient2, encounter2);
 
         // Both are L2-normalised by getCombinedVector, so norms should be ~1.
         float norm1 = 0.0f, norm2 = 0.0f;
@@ -80,7 +80,7 @@ int main(int argc, char* argv[]) {
         auto printGroup = [](const std::string& label,
                               const std::vector<std::string>& words,
                               const std::vector<std::string>& patient,
-                              const std::vector<std::string>& provider) {
+                              const std::vector<std::string>& encounter) {
             std::cout << label << " words: [";
             for (size_t i = 0; i < words.size(); ++i) {
                 std::cout << words[i]; if (i < words.size()-1) std::cout << ", ";
@@ -93,18 +93,18 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "]";
             }
-            if (!provider.empty()) {
-                std::cout << "  provider: [";
-                for (size_t i = 0; i < provider.size(); ++i) {
-                    std::cout << provider[i]; if (i < provider.size()-1) std::cout << ", ";
+            if (!encounter.empty()) {
+                std::cout << "  encounter: [";
+                for (size_t i = 0; i < encounter.size(); ++i) {
+                    std::cout << encounter[i]; if (i < encounter.size()-1) std::cout << ", ";
                 }
                 std::cout << "]";
             }
             std::cout << "\n";
         };
 
-        printGroup("A:", words1, patient1, provider1);
-        printGroup("B:", words2, patient2, provider2);
+        printGroup("A:", words1, patient1, encounter1);
+        printGroup("B:", words2, patient2, encounter2);
 
         std::cout << "\n--- Similarity Metrics ---\n"
                   << "  Cosine Similarity:  " << std::fixed << std::setprecision(6) << cosine_sim  << "\n"

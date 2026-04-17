@@ -6,7 +6,7 @@ from typing import List, Tuple
 from fasttext_context import FastTextContext
 
 def parse_line(line: str) -> Tuple[List[str], List[str], List[str]]:
-    """Parse a line with 'words' 'patients' 'providers' format."""
+    """Parse a line with 'words' 'patient_group' 'encounter_group' format."""
     parts = line.strip().split("|||")
     return (parts[0].strip().split(),
             parts[1].strip().split(),
@@ -69,9 +69,9 @@ def main():
     print(f"{'Base':<40} | {'Target':<40} | {'Original':>8} | {'95% CI':<20}")
     print("-" * 120)
 
-    for i, (b, t) in enumerate(product(bases, targets)):
+    for i, (base_entry, target_entry) in enumerate(product(bases, targets)):
         # Original similarity
-        orig_sim = calculate_similarity(orig_model, b, t)
+        orig_sim = calculate_similarity(orig_model, base_entry, target_entry)
         
         boot_sims = all_boot_sims[i]
         if boot_sims:
@@ -83,9 +83,9 @@ def main():
         else:
             ci_str = "N/A"
 
-        base_str = f"{' '.join(b[0]) if b[0] else ''} {b[1][0] if b[1] else ''} {b[2][0] if b[2] else ''}"
-        target_str = f"{t[0][0] if t[0] else ''} {t[1][0] if t[1] else ''} {t[2][0] if t[2] else ''}"
-        print(f"{base_str[:40]:<40} | {target_str[:40]:<40} | {orig_sim:8.4f} | {ci_str}")
+        base_str = f"{' '.join(base_entry[0]) if base_entry[0] else ''} {base_entry[1][0] if base_entry[1] else ''} {base_entry[2][0] if base_entry[2] else ''}"
+        target_str = f"{target_entry[0][0] if target_entry[0] else ''} {target_entry[1][0] if target_entry[1] else ''} {target_entry[2][0] if target_entry[2] else ''}"
+        print(f"{base_str[:80]:<80} | {target_str[:40]:<16} | {orig_sim:8.4f} | {ci_str}")
 
 if __name__ == "__main__":
     main()
